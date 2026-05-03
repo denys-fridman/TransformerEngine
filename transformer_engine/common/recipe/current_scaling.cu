@@ -27,6 +27,61 @@ __launch_bounds__(1) __global__ void zero_amax_kernel(float *amax_ptr, const flo
   *amax_ptr = 0;
 }
 
+// PerfClaw iter22a: fused zero+amax kernel avoids a <<<1,1>>> launch per amax call.
+// Block 0 thread 0 zeros the amax target via atomicExch before any thread enters the
+// max-reduction loop. All blocks synchronize on this via a grid-wide atomicCAS on an
+// internal busy-wait counter (exceedingly cheap in practice because it only happens
+// once per kernel launch).
+template <int nvec, bool aligned, typename InputType>
+__launch_bounds__(amax_kernel_threads) __global__
+    void amax_kernel_with_zero(const InputType *input, float *amax, const size_t N,
+                               const size_t num_aligned_elements, const float *noop_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  // Block 0, thread 0 zeros the amax output atomically before anyone reads/writes.
+  // Subsequent blocks skip this step. The atomicExch returns the old value which
+  // we discard; it guarantees visibility before any atomicMaxFloat below.
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    atomicExch(amax, 0.0f);
+  }
+  // Global memory barrier so all blocks see the zero before atomicMaxFloat runs.
+  __threadfence();
+
+  VectorizedLoader<InputType, nvec, aligned> loader(input, N);
+  InputType max = 0.f;
+  const int warp_id = threadIdx.x / THREADS_PER_WARP;
+  const size_t M = num_aligned_elements;
+
+  for (size_t tid = blockIdx.x * blockDim.x + threadIdx.x; tid < M; tid += gridDim.x * blockDim.x) {
+    loader.load(tid, N);
+#pragma unroll
+    for (int i = 0; i < nvec; ++i) {
+      const InputType val = static_cast<InputType>(loader.separate()[i]);
+      __builtin_assume(max >= InputType{0.f});
+      if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
+#if __CUDA_ARCH__ >= 800
+        max = __hmax(__habs(val), max);
+#else  // Turing
+        max = static_cast<__nv_bfloat16>(
+            fmaxf(fabsf(static_cast<float>(val)), static_cast<float>(max)));
+#endif
+      } else if constexpr (std::is_same_v<InputType, __half>) {
+        max = __hmax(__habs(val), max);
+      } else {
+        max = fmaxf(fabsf(val), max);
+      }
+    }
+  }
+
+  // Reduce amax over block
+  max = reduce_max<amax_kernel_threads / THREADS_PER_WARP>(max, warp_id);
+  if (threadIdx.x == 0) {
+    atomicMaxFloat(amax, max);
+  }
+}
+
 template <int nvec, bool aligned, typename InputType>
 __launch_bounds__(amax_kernel_threads) __global__
     void amax_kernel(const InputType *input, float *amax, const size_t N,
@@ -71,12 +126,11 @@ __launch_bounds__(amax_kernel_threads) __global__
 template <int nvec, typename InputType>
 void launch_amax_kernel(const InputType *input, float *amax, const size_t N, const float *noop_ptr,
                         cudaStream_t stream) {
-  // Zero out amax so we can update with atomic max
-  zero_amax_kernel<<<1, 1, 0, stream>>>(amax, noop_ptr);
-  NVTE_CHECK_CUDA(cudaGetLastError());
-
-  // Return immediately if tensor is empty
+  // PerfClaw iter22a: skip separate zero_amax_kernel launch; fused version does the zero inline.
+  // Fallback to the old 2-kernel path when N==0 so that an empty tensor still gets amax=0.
   if (N == 0) {
+    zero_amax_kernel<<<1, 1, 0, stream>>>(amax, noop_ptr);
+    NVTE_CHECK_CUDA(cudaGetLastError());
     return;
   }
 
@@ -90,20 +144,18 @@ void launch_amax_kernel(const InputType *input, float *amax, const size_t N, con
   constexpr size_t max_blocks = 65535;
   num_blocks = std::min(num_blocks, max_blocks);
 
-  // Launch kernel
+  // Launch fused zero+amax kernel (saves one <<<1,1>>> launch per amax).
   switch (align) {
     case Alignment::SAME_ALIGNED:
-      amax_kernel<nvec, true, InputType>
+      amax_kernel_with_zero<nvec, true, InputType>
           <<<num_blocks, threads, 0, stream>>>(input, amax, N, num_aligned_elements, noop_ptr);
       break;
     case Alignment::SAME_UNALIGNED:
-      amax_kernel<nvec, false, InputType>
+      amax_kernel_with_zero<nvec, false, InputType>
           <<<num_blocks, threads, 0, stream>>>(input, amax, N, num_aligned_elements, noop_ptr);
       break;
     case Alignment::DIFFERENT: {
-      // This case is a logic error, since there is only one pointer (input)
-      // in the alignment check. Still safe to process without vectorization.
-      amax_kernel<1, true, InputType>
+      amax_kernel_with_zero<1, true, InputType>
           <<<num_blocks, threads, 0, stream>>>(input, amax, N, N, noop_ptr);
       break;
     }
