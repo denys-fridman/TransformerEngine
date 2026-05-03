@@ -21,4 +21,4 @@ class MultiTensorApply:  # pylint: disable=too-few-public-methods
         return op(self.chunk_size, noop_flag_buffer, tensor_lists, *args)
 
 
-multi_tensor_applier = MultiTensorApply(2048 * 128)
+multi_tensor_applier = MultiTensorApply(2048 * 256)
