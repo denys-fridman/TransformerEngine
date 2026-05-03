@@ -15,7 +15,7 @@
 namespace transformer_engine {
 namespace multi_tensor_adam {
 
-#define BLOCK_SIZE 512
+#define BLOCK_SIZE 256
 #define ILP 4
 #define THREADS_PER_WARP 32
 
