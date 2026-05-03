@@ -18,7 +18,7 @@
 namespace transformer_engine {
 namespace {
 
-constexpr int amax_kernel_threads = 512;
+constexpr int amax_kernel_threads = 256;
 
 __launch_bounds__(1) __global__ void zero_amax_kernel(float *amax_ptr, const float *noop_ptr) {
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
