@@ -1722,7 +1722,20 @@ class NVFP4BlockScalingRecipeState(RecipeState):
         if self.mode not in ("forward", "backward"):
             raise RuntimeError(f"Unexpected recipe mode ({self.mode})")
 
-        return [_make(self._slot_tensor_type(idx)) for idx in range(self.num_quantizers)]
+        def _tensor_type(idx: int) -> str:
+            # The positional fallback in _slot_tensor_type assumes 3 quantizers
+            # per GEMM ([input, weight, output]). Some callers register only 2
+            # ([input, weight]) without providing roles; there the weight slot
+            # is idx % 2 == 1.
+            if (
+                self.mode == "forward"
+                and self.num_quantizers % 3 != 0
+                and self._slot_role(idx).tensor_type not in self._KNOWN_TENSOR_TYPES
+            ):
+                return "weight" if idx % 2 == 1 else "input"
+            return self._slot_tensor_type(idx)
+
+        return [_make(_tensor_type(idx)) for idx in range(self.num_quantizers)]
 
 
 def _handle_delayed_scaling_requests(
