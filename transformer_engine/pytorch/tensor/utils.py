@@ -5,7 +5,29 @@
 """Helper functions for using fp8/nvfp4 tensors as weights"""
 
 from typing import Optional, Union, List
+import os
 import torch
+
+# NVTE_NVFP4_AMAX_REDUCE_INTERVAL: skip the two nvfp4 amax all-reduces on
+# steps where step % interval != 0 (reuse cached amaxes instead).
+# Default 1 = reduce every step (original behaviour).
+_NVFP4_AMAX_REDUCE_INTERVAL: int = int(os.getenv("NVTE_NVFP4_AMAX_REDUCE_INTERVAL", "1"))
+_nvfp4_amax_step_counter: int = 0
+_nvfp4_amax_cache: dict = {}  # group_id -> (packed_amaxes, global_amaxes) snapshots
+
+# NVTE_NVFP4_ASYNC_WEIGHT_CAST: when "1", enqueue per-weight casts on a high-priority
+# CUDA stream so they overlap with the Adam update for subsequent layers.
+_NVFP4_ASYNC_CAST: bool = os.getenv("NVTE_NVFP4_ASYNC_WEIGHT_CAST", "0") == "1"
+_nvfp4_cast_stream: Optional[torch.cuda.Stream] = None
+
+
+def _get_nvfp4_cast_stream() -> torch.cuda.Stream:
+    """Return (creating lazily) the dedicated NVFP4 weight-cast CUDA stream."""
+    global _nvfp4_cast_stream
+    if _nvfp4_cast_stream is None:
+        _nvfp4_cast_stream = torch.cuda.Stream(priority=-1)  # high-priority
+    return _nvfp4_cast_stream
+
 
 import transformer_engine_torch as tex
 from transformer_engine_torch import (
@@ -715,11 +737,42 @@ def _cast_master_weights_to_nvfp4_2d(
             block_len,
         )
 
+    # Amax reduce-interval: skip all-reduces on non-interval steps (reuse cache).
+    global _nvfp4_amax_step_counter, _nvfp4_amax_cache
+    _nvfp4_amax_step_counter += 1
+    cache_key = id(group)
+    do_reduce = (
+        _NVFP4_AMAX_REDUCE_INTERVAL <= 1
+        or _nvfp4_amax_step_counter % _NVFP4_AMAX_REDUCE_INTERVAL == 0
+        or cache_key not in _nvfp4_amax_cache
+    )
+
     if packed_amaxes.numel() > 0:
-        torch.distributed.all_reduce(packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+        if (
+            do_reduce
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=group) > 1
+        ):
+            torch.distributed.all_reduce(packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+        elif not do_reduce and cache_key in _nvfp4_amax_cache:
+            cached_pa, _ = _nvfp4_amax_cache[cache_key]
+            if cached_pa.shape == packed_amaxes.shape:
+                packed_amaxes.copy_(cached_pa)
 
     if global_amaxes.numel() > 0:
-        torch.distributed.all_reduce(global_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+        if (
+            do_reduce
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=group) > 1
+        ):
+            torch.distributed.all_reduce(global_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+        elif not do_reduce and cache_key in _nvfp4_amax_cache:
+            _, cached_ga = _nvfp4_amax_cache[cache_key]
+            if cached_ga.shape == global_amaxes.shape:
+                global_amaxes.copy_(cached_ga)
+
+    if do_reduce and (packed_amaxes.numel() > 0 or global_amaxes.numel() > 0):
+        _nvfp4_amax_cache[cache_key] = (packed_amaxes.clone(), global_amaxes.clone())
 
     # Use GPU kernel to compute global encode scales from global amaxes
     # This replaces multiple Python tensor operations with a single kernel
@@ -825,18 +878,47 @@ def _cast_master_weights_to_nvfp4_2d(
             block_len,
         )
 
-    # Batched multi-tensor call for partial cast
+    # Batched multi-tensor call for partial cast.
+    # When NVTE_NVFP4_ASYNC_WEIGHT_CAST=1 the cast is enqueued on a high-priority
+    # stream so it can overlap with the Adam update of subsequent layers.
     if partial_cast_inp_list:
-        tex.nvfp4_multi_tensor_2d_partial_cast(
-            partial_cast_inp_list,
-            partial_cast_out_list,
-            partial_cast_scale_list,
-            partial_cast_global_scale_list,
-            partial_cast_h_list,
-            partial_cast_w_list,
-            partial_cast_start_offset_list,
-            block_len,
-        )
+        if _NVFP4_ASYNC_CAST:
+            _cast_stream = _get_nvfp4_cast_stream()
+            # Record event: signal that the default (Adam) stream has produced
+            # the updated master weights that the cast stream will read.
+            _adam_done = torch.cuda.Event()
+            _adam_done.record(torch.cuda.current_stream())
+            _cast_stream.wait_event(_adam_done)
+            with torch.cuda.stream(_cast_stream):
+                tex.nvfp4_multi_tensor_2d_partial_cast(
+                    partial_cast_inp_list,
+                    partial_cast_out_list,
+                    partial_cast_scale_list,
+                    partial_cast_global_scale_list,
+                    partial_cast_h_list,
+                    partial_cast_w_list,
+                    partial_cast_start_offset_list,
+                    block_len,
+                )
+            # Record cast-done event so the caller can sync before all-gather.
+            _cast_done = torch.cuda.Event()
+            _cast_done.record(_cast_stream)
+            # Store on the module so the optimizer step can wait before param sync.
+            _cast_master_weights_to_nvfp4_2d._last_cast_event = _cast_done
+            # Synchronise default stream with cast stream so downstream code
+            # (e.g. post_all_gather_processing) sees the updated model weights.
+            torch.cuda.current_stream().wait_event(_cast_done)
+        else:
+            tex.nvfp4_multi_tensor_2d_partial_cast(
+                partial_cast_inp_list,
+                partial_cast_out_list,
+                partial_cast_scale_list,
+                partial_cast_global_scale_list,
+                partial_cast_h_list,
+                partial_cast_w_list,
+                partial_cast_start_offset_list,
+                block_len,
+            )
 
 
 def _cast_master_weights_to_fp8_mxfp8_scaling(

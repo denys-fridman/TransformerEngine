@@ -134,13 +134,21 @@ constexpr int kThreadsPerWarp = 32;
 // for fp4, we use uint8_t to store 2 fp4 numbers
 constexpr int kNFP4PerContainer = 2;
 
-// Hyperparameters for performance tuning
+// Hyperparameters for performance tuning.
+// SM100 (Blackwell / GB200) has 228 KB shared memory per SM vs 164 KB on SM90.
+// Doubling the tile dimension halves kernel launches per tensor and improves
+// HBM bandwidth utilization through longer contiguous memory accesses.
+#if __CUDA_ARCH__ >= 1000
+constexpr int kTileDim = 256;
+constexpr int kThreadsPerBlock = 512;  // Scale threads proportionally (16 warps)
+#else
 constexpr int kTileDim = 128;
+constexpr int kThreadsPerBlock = 256;  // Thread block size, 8 warps in total
+#endif
 // constexpr int kScaleDim = 32;
 constexpr int kNVecIn = 8;             // The number of elements each LDG touches
 constexpr int kNVecOut = 16;           // The number of elements each STG touches
 constexpr int kNVecSMem = 2;           // The number of elements each LDS/STS touches
-constexpr int kThreadsPerBlock = 256;  // Thread block size, 8 warps in total
 
 // Auto-calculated constants, do not modify directly)
 static_assert(kNVecIn % kNVecSMem == 0, "kNVecIn must be divisible by kNVecSMem");

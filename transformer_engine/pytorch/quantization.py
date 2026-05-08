@@ -513,11 +513,21 @@ class FP8GlobalStateManager:
             recipe, group = cls.autocast_arguments[autocast_key]
             contiguous_amax = torch.cat(amax_buffer)
 
-            # Reduction.
+            # Reduction — gated by NVTE_DPA_AMAX_REDUCE_INTERVAL to skip on
+            # non-interval steps (stale amax is safe for Float8CurrentScaling
+            # with histlen=1 when amax changes slowly in stable training).
+            _dpa_interval = int(os.getenv("NVTE_DPA_AMAX_REDUCE_INTERVAL", "1"))
+            _do_dpa_reduce = (
+                _dpa_interval <= 1
+                or not hasattr(cls, "_dpa_amax_step")
+                or cls._dpa_amax_step % _dpa_interval == 0
+            )
+            cls._dpa_amax_step = getattr(cls, "_dpa_amax_step", 0) + 1
             if (
                 recipe.reduce_amax
                 and torch.distributed.is_initialized()
                 and torch.distributed.get_world_size(group=group) > 1
+                and _do_dpa_reduce
             ):
                 cls.reduce_tensor_across_group_op_max(contiguous_amax, group)
 
