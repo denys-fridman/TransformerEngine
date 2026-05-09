@@ -143,14 +143,18 @@ def prepare_for_saving(
     """Prepare tensors for saving. Needed because save_for_backward accepts only
     torch.Tensor/torch.nn.Parameter types, while we want to be able to save
     the internal TensorStorage types too."""
+    from transformer_engine.pytorch import cpu_offload_v1
 
     tensor_list, tensor_objects_list = [], []
     for tensor in tensors:
-        if tensor is None or isinstance(tensor, torch.Tensor):
+        store_as_raw_tensors = cpu_offload_v1.CPUOffloadEnabled and isinstance(tensor, QuantizedTensor)
+        if tensor is None or (isinstance(tensor, torch.Tensor) and not store_as_raw_tensors):
             tensor_list.append(tensor)
             tensor_objects_list.append(None)
         else:
             t, t_obj = tensor.prepare_for_saving()
+            if cpu_offload_v1.CPUOffloadEnabled:
+                setattr(t_obj, "offloaded_tensor", True)
             tensor_list.extend(t)
             tensor_objects_list.append(t_obj)
 
@@ -173,7 +177,13 @@ def restore_from_saved(
     """
     tensor_objects = []
     for tensor in tensors:
-        if tensor is None or isinstance(tensor, torch.Tensor):
+        if tensor is not None:
+            store_as_raw_tensors = getattr(tensor, "offloaded_tensor", False) and isinstance(tensor, QuantizedTensor)
+            if hasattr(tensor, "offloaded_tensor"):
+                delattr(tensor, "offloaded_tensor")
+        else:
+            store_as_raw_tensors = False
+        if tensor is None or (isinstance(tensor, torch.Tensor) and not store_as_raw_tensors):
             tensor_objects.append(saved_tensors[0])
             saved_tensors = saved_tensors[1:]
         else:
