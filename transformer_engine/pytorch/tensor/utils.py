@@ -737,42 +737,40 @@ def _cast_master_weights_to_nvfp4_2d(
             block_len,
         )
 
-    # Amax reduce-interval: skip all-reduces on non-interval steps (reuse cache).
-    global _nvfp4_amax_step_counter, _nvfp4_amax_cache
-    _nvfp4_amax_step_counter += 1
-    cache_key = id(group)
-    do_reduce = (
-        _NVFP4_AMAX_REDUCE_INTERVAL <= 1
-        or _nvfp4_amax_step_counter % _NVFP4_AMAX_REDUCE_INTERVAL == 0
-        or cache_key not in _nvfp4_amax_cache
-    )
-
-    if packed_amaxes.numel() > 0:
-        if (
-            do_reduce
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size(group=group) > 1
-        ):
+    # Amax reduce-interval: fast path at default interval=1 restores original behaviour
+    # exactly (no extra Python overhead per call). Interval>1 uses cache logic.
+    if _NVFP4_AMAX_REDUCE_INTERVAL <= 1:
+        if packed_amaxes.numel() > 0:
             torch.distributed.all_reduce(packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
-        elif not do_reduce and cache_key in _nvfp4_amax_cache:
-            cached_pa, _ = _nvfp4_amax_cache[cache_key]
-            if cached_pa.shape == packed_amaxes.shape:
-                packed_amaxes.copy_(cached_pa)
-
-    if global_amaxes.numel() > 0:
-        if (
-            do_reduce
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size(group=group) > 1
-        ):
+        if global_amaxes.numel() > 0:
             torch.distributed.all_reduce(global_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
-        elif not do_reduce and cache_key in _nvfp4_amax_cache:
-            _, cached_ga = _nvfp4_amax_cache[cache_key]
-            if cached_ga.shape == global_amaxes.shape:
-                global_amaxes.copy_(cached_ga)
+    else:
+        global _nvfp4_amax_step_counter, _nvfp4_amax_cache
+        _nvfp4_amax_step_counter += 1
+        cache_key = id(group)
+        do_reduce = (
+            _nvfp4_amax_step_counter % _NVFP4_AMAX_REDUCE_INTERVAL == 0
+            or cache_key not in _nvfp4_amax_cache
+        )
 
-    if _NVFP4_AMAX_REDUCE_INTERVAL > 1 and do_reduce and (packed_amaxes.numel() > 0 or global_amaxes.numel() > 0):
-        _nvfp4_amax_cache[cache_key] = (packed_amaxes.clone(), global_amaxes.clone())
+        if packed_amaxes.numel() > 0:
+            if do_reduce and torch.distributed.is_initialized() and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+            elif not do_reduce and cache_key in _nvfp4_amax_cache:
+                cached_pa, _ = _nvfp4_amax_cache[cache_key]
+                if cached_pa.shape == packed_amaxes.shape:
+                    packed_amaxes.copy_(cached_pa)
+
+        if global_amaxes.numel() > 0:
+            if do_reduce and torch.distributed.is_initialized() and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(global_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+            elif not do_reduce and cache_key in _nvfp4_amax_cache:
+                _, cached_ga = _nvfp4_amax_cache[cache_key]
+                if cached_ga.shape == global_amaxes.shape:
+                    global_amaxes.copy_(cached_ga)
+
+        if do_reduce and (packed_amaxes.numel() > 0 or global_amaxes.numel() > 0):
+            _nvfp4_amax_cache[cache_key] = (packed_amaxes.clone(), global_amaxes.clone())
 
     # Use GPU kernel to compute global encode scales from global amaxes
     # This replaces multiple Python tensor operations with a single kernel
