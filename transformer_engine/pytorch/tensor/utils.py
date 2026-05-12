@@ -771,7 +771,7 @@ def _cast_master_weights_to_nvfp4_2d(
             if cached_ga.shape == global_amaxes.shape:
                 global_amaxes.copy_(cached_ga)
 
-    if do_reduce and (packed_amaxes.numel() > 0 or global_amaxes.numel() > 0):
+    if _NVFP4_AMAX_REDUCE_INTERVAL > 1 and do_reduce and (packed_amaxes.numel() > 0 or global_amaxes.numel() > 0):
         _nvfp4_amax_cache[cache_key] = (packed_amaxes.clone(), global_amaxes.clone())
 
     # Use GPU kernel to compute global encode scales from global amaxes
