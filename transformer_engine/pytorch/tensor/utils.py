@@ -8,12 +8,16 @@ from typing import Optional, Union, List
 import os
 import torch
 
-# NVTE_NVFP4_AMAX_REDUCE_INTERVAL: skip the two nvfp4 amax all-reduces on
-# steps where step % interval != 0 (reuse cached amaxes instead).
-# Default 1 = reduce every step (original behaviour).
+# NVTE_NVFP4_AMAX_REDUCE_INTERVAL: on non-interval steps, skip the amax compute
+# kernels (amax_kernel, zero_amax), the two nvfp4 amax all-reduces, and the
+# fused-scale/swizzle kernel — reusing cached scale tensors from the last
+# interval step.  The weight cast (quantize_transpose_nvfp4) still runs every
+# step because Adam updates master weights each step.
+# Default 1 = full compute every step (original behaviour).
 _NVFP4_AMAX_REDUCE_INTERVAL: int = int(os.getenv("NVTE_NVFP4_AMAX_REDUCE_INTERVAL", "1"))
 _nvfp4_amax_step_counter: int = 0
-_nvfp4_amax_cache: dict = {}  # group_id -> (packed_amaxes, global_amaxes) snapshots
+_nvfp4_amax_cache: dict = {}   # group_id -> (packed_amaxes, global_amaxes)
+_nvfp4_scale_cache: dict = {}  # group_id -> (packed_scales, global_scale_tensor)
 
 # NVTE_NVFP4_ASYNC_WEIGHT_CAST: when "1", enqueue per-weight casts on a high-priority
 # CUDA stream so they overlap with the Adam update for subsequent layers.
@@ -725,58 +729,61 @@ def _cast_master_weights_to_nvfp4_2d(
             w_list.append(w)
             start_offset_list.append(start_offset)
 
-    # Batched multi-tensor call for partial and global amax computation
-    if master_weight_list:
-        tex.nvfp4_multi_tensor_compute_partial_amax(
-            master_weight_list,
-            partial_amax_list,
-            global_amax_list,
-            h_list,
-            w_list,
-            start_offset_list,
-            block_len,
-        )
+    # Amax + scale interval gate.
+    # Fast path (interval=1): original behaviour, no extra Python overhead.
+    # Interval>1: on non-interval steps skip the amax compute kernels
+    # (nvfp4_multi_tensor_compute_partial_amax) AND the fused-scale/swizzle kernel
+    # (nvfp4_multi_tensor_fused_scale), reusing cached scale tensors from the last
+    # interval step.  The weight cast still runs every step.
+    global _nvfp4_amax_step_counter, _nvfp4_amax_cache, _nvfp4_scale_cache
 
-    # Amax reduce-interval: fast path at default interval=1 restores original behaviour
-    # exactly (no extra Python overhead per call). Interval>1 uses cache logic.
     if _NVFP4_AMAX_REDUCE_INTERVAL <= 1:
+        # ── Full compute every step (original path) ─────────────────────────
+        if master_weight_list:
+            tex.nvfp4_multi_tensor_compute_partial_amax(
+                master_weight_list, partial_amax_list, global_amax_list,
+                h_list, w_list, start_offset_list, block_len,
+            )
         if packed_amaxes.numel() > 0:
             torch.distributed.all_reduce(packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
         if global_amaxes.numel() > 0:
             torch.distributed.all_reduce(global_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
+        _do_scale_update = True
     else:
-        global _nvfp4_amax_step_counter, _nvfp4_amax_cache
+        # ── Interval path ────────────────────────────────────────────────────
         _nvfp4_amax_step_counter += 1
         cache_key = id(group)
-        do_reduce = (
+        _do_scale_update = (
             _nvfp4_amax_step_counter % _NVFP4_AMAX_REDUCE_INTERVAL == 0
-            or cache_key not in _nvfp4_amax_cache
+            or cache_key not in _nvfp4_scale_cache
         )
 
-        if packed_amaxes.numel() > 0:
-            if do_reduce and torch.distributed.is_initialized() and torch.distributed.get_world_size(group=group) > 1:
+        if _do_scale_update:
+            # Compute amaxes and allreduce as normal
+            if master_weight_list:
+                tex.nvfp4_multi_tensor_compute_partial_amax(
+                    master_weight_list, partial_amax_list, global_amax_list,
+                    h_list, w_list, start_offset_list, block_len,
+                )
+            if packed_amaxes.numel() > 0 and torch.distributed.is_initialized() \
+                    and torch.distributed.get_world_size(group=group) > 1:
                 torch.distributed.all_reduce(packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
-            elif not do_reduce and cache_key in _nvfp4_amax_cache:
-                cached_pa, _ = _nvfp4_amax_cache[cache_key]
-                if cached_pa.shape == packed_amaxes.shape:
-                    packed_amaxes.copy_(cached_pa)
-
-        if global_amaxes.numel() > 0:
-            if do_reduce and torch.distributed.is_initialized() and torch.distributed.get_world_size(group=group) > 1:
+            if global_amaxes.numel() > 0 and torch.distributed.is_initialized() \
+                    and torch.distributed.get_world_size(group=group) > 1:
                 torch.distributed.all_reduce(global_amaxes, op=torch.distributed.ReduceOp.MAX, group=group)
-            elif not do_reduce and cache_key in _nvfp4_amax_cache:
-                _, cached_ga = _nvfp4_amax_cache[cache_key]
-                if cached_ga.shape == global_amaxes.shape:
-                    global_amaxes.copy_(cached_ga)
-
-        if do_reduce and (packed_amaxes.numel() > 0 or global_amaxes.numel() > 0):
-            _nvfp4_amax_cache[cache_key] = (packed_amaxes.clone(), global_amaxes.clone())
+        # On non-update steps: packed_amaxes / global_amaxes stay as zeros —
+        # they are not used (we skip fused_scale below and reuse cached scales).
 
     # Use GPU kernel to compute global encode scales from global amaxes
     # This replaces multiple Python tensor operations with a single kernel
     global_scale_tensor = torch.empty_like(global_amaxes)
-
-    tex.nvfp4_compute_global_scale(global_amaxes, global_scale_tensor)
+    if _do_scale_update:
+        tex.nvfp4_compute_global_scale(global_amaxes, global_scale_tensor)
+    elif cache_key in _nvfp4_scale_cache:
+        # Restore cached global scales so partial_cast uses correct values
+        _, cached_gs = _nvfp4_scale_cache[cache_key]
+        if cached_gs.shape == global_scale_tensor.shape:
+            global_scale_tensor.copy_(cached_gs)
     global_scale_views = [global_scale_tensor[i : i + 1] for i in range(len(params))]
 
     # Collect tensors for batched fused scale kernel
@@ -862,8 +869,10 @@ def _cast_master_weights_to_nvfp4_2d(
             partial_cast_w_list.append(w)
             partial_cast_start_offset_list.append(start_offset)
 
-    # Batched multi-tensor call for fused scale
-    if fused_scale_block_amax_list:
+    # Batched multi-tensor call for fused scale (amax→scale→swizzle).
+    # Skipped on non-interval steps: _rowwise_scale_inv retains values from the
+    # last interval step; packed_scales is repopulated from cache for the cast.
+    if fused_scale_block_amax_list and _do_scale_update:
         tex.nvfp4_multi_tensor_fused_scale(
             fused_scale_block_amax_list,
             fused_scale_global_amax_list,
@@ -875,6 +884,13 @@ def _cast_master_weights_to_nvfp4_2d(
             fused_scale_rows_padded_list,
             block_len,
         )
+        if _NVFP4_AMAX_REDUCE_INTERVAL > 1:
+            _nvfp4_scale_cache[cache_key] = (packed_scales.clone(), global_scale_tensor.clone())
+    elif not _do_scale_update and cache_key in _nvfp4_scale_cache:
+        # Restore cached per-block scales so the weight cast uses correct values
+        cached_ps, _ = _nvfp4_scale_cache[cache_key]
+        if cached_ps.shape == packed_scales.shape:
+            packed_scales.copy_(cached_ps)
 
     # Batched multi-tensor call for partial cast.
     # When NVTE_NVFP4_ASYNC_WEIGHT_CAST=1 the cast is enqueued on a high-priority
