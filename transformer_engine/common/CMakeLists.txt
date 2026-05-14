@@ -142,6 +142,7 @@ list(APPEND transformer_engine_cuda_sources
      fused_attn/fused_attn_f16_max512_seqlen.cu
      fused_attn/fused_attn_f16_arbitrary_seqlen.cu
      fused_attn/fused_attn_fp8.cu
+     fused_attn/fused_attn_sm100_bprop.cu
      fused_attn/utils.cu
      gemm/cublaslt_gemm.cu
      gemm/cublaslt_grouped_gemm.cu

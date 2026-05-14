@@ -13,6 +13,7 @@
 #include "fused_attn_f16_arbitrary_seqlen.h"
 #include "fused_attn_f16_max512_seqlen.h"
 #include "fused_attn_fp8.h"
+#include "fused_attn_sm100_bprop.h"
 #include "utils.h"
 
 namespace transformer_engine {
@@ -776,14 +777,30 @@ void nvte_fused_attn_bwd(const NVTETensor Q, const NVTETensor K, const NVTETenso
 #endif
   } else if (fused_attention_backend == NVTE_Fused_Attn_Backend::NVTE_FP8) {
 #if (CUDNN_VERSION >= 8900)
+    // SM100 custom kernel: use if supported (larger tiles → less L2 pressure).
+    // Disable via NVTE_SM100_BPROP_DISABLE=1 for debugging.
+    const char *disable_custom = std::getenv("NVTE_SM100_BPROP_DISABLE");
     const Tensor *input_M = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[0]);
     const Tensor *input_ZInv = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[1]);
     const Tensor *input_rng_state = convertNVTETensorCheck(Aux_CTX_Tensors->tensors[2]);
-    fused_attn_fp8_bwd(b, h_q, h_kv, max_seqlen_q, max_seqlen_kv, d_qk, attn_scale, dropout,
-                       qkv_layout, bias_type, attn_mask_type, deterministic, input_Q, input_K,
-                       input_V, input_O, input_dO, input_M, input_ZInv, input_S, input_output_dP,
-                       output_dQ, output_dK, output_dV, input_cu_seqlens_q, input_cu_seqlens_kv,
-                       input_rng_state, wkspace, stream, handle);
+    // input_M stores log-sum-exp (LSE) in the FP8 path.
+    if (!disable_custom &&
+        fused_attn_sm100_bprop_is_supported(
+            sm_arch_, input_Q->data.dtype, d_qk,
+            max_seqlen_q, max_seqlen_kv, dropout, bias_type, attn_mask_type)) {
+      fused_attn_sm100_bprop(b, h_q, max_seqlen_q, max_seqlen_kv, d_qk,
+                              attn_scale, qkv_layout, attn_mask_type,
+                              input_Q, input_K, input_V, input_O, input_dO,
+                              input_M,  // LSE
+                              output_dQ, output_dK, output_dV,
+                              wkspace, stream);
+    } else {
+      fused_attn_fp8_bwd(b, h_q, h_kv, max_seqlen_q, max_seqlen_kv, d_qk, attn_scale, dropout,
+                         qkv_layout, bias_type, attn_mask_type, deterministic, input_Q, input_K,
+                         input_V, input_O, input_dO, input_M, input_ZInv, input_S, input_output_dP,
+                         output_dQ, output_dK, output_dV, input_cu_seqlens_q, input_cu_seqlens_kv,
+                         input_rng_state, wkspace, stream, handle);
+    }
 #else
     NVTE_ERROR("cuDNN 8.9.0 is required for FP8 fused attention. \n");
 #endif
