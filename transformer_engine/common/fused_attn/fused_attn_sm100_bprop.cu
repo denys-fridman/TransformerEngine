@@ -105,10 +105,11 @@ flash_attn_sm100_dQ(
   const int stride = H * HD;  // elements between consecutive sequence positions
 
   // Global base pointers (head hi, batch bi, query qi_base)
-  auto gptr = [&](const __nv_fp8_e4m3* base, int qi) __device__ {
+  // Note: lambdas inside __global__ cannot be annotated __device__; annotation is implicit.
+  auto gptr = [&](const __nv_fp8_e4m3* base, int qi) {
     return base + bi * S * stride + qi * stride + hi * HD;
   };
-  auto gptr_k = [&](const __nv_fp8_e4m3* base, int ki) __device__ {
+  auto gptr_k = [&](const __nv_fp8_e4m3* base, int ki) {
     return base + bi * S * stride + ki * stride + hi * HD;
   };
 

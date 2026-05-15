@@ -695,6 +695,7 @@ void nvte_fused_attn_bwd(const NVTETensor Q, const NVTETensor K, const NVTETenso
                          NVTETensor workspace, cudaStream_t stream) {
   NVTE_API_CALL(nvte_flash_attn_bwd);
   using namespace transformer_engine;
+  const int sm_arch_ = cuda::sm_arch(cuda::current_device());
   const Tensor *input_cu_seqlens_q = convertNVTETensorCheck(cu_seqlens_q);
   const Tensor *input_cu_seqlens_kv = convertNVTETensorCheck(cu_seqlens_kv);
   const Tensor *input_cu_seqlens_q_padded = convertNVTETensorCheck(cu_seqlens_q_padded);
