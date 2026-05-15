@@ -23,12 +23,12 @@
  */
 
 #include "fused_attn_sm100_bprop.h"
-#include "common/util/logging.h"
+#include "../common.h"
+#include "../util/system.h"
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
-#include <cstdlib>
 
 namespace transformer_engine {
 
@@ -460,21 +460,18 @@ void fused_attn_sm100_bprop(size_t batch,
   float* dV_amax  = amax_buf + 2;
   cudaMemsetAsync(amax_buf, 0, 3 * sizeof(float), stream);
 
-  // Extract per-tensor scales (FP8 inputs always have a scale factor)
-  // TE stores scale in Tensor::scale as a 1-element float tensor.
+  // FP8 dequantization: x_float = x_fp8 * scale_inv  (scale_inv = max_abs / 448)
   float Q_scale  = 1.f, K_scale  = 1.f;
   float dO_scale = 1.f, O_scale  = 1.f;
-  if (input_Q->scale.dptr)
-    cudaMemcpyAsync(&Q_scale,  input_Q->scale.dptr,  sizeof(float), cudaMemcpyDeviceToHost, stream);
-  if (input_K->scale.dptr)
-    cudaMemcpyAsync(&K_scale,  input_K->scale.dptr,  sizeof(float), cudaMemcpyDeviceToHost, stream);
-  if (input_dO->scale.dptr)
-    cudaMemcpyAsync(&dO_scale, input_dO->scale.dptr, sizeof(float), cudaMemcpyDeviceToHost, stream);
-  if (input_O->scale.dptr)
-    cudaMemcpyAsync(&O_scale,  input_O->scale.dptr,  sizeof(float), cudaMemcpyDeviceToHost, stream);
+  if (input_Q->scale_inv.dptr)
+    cudaMemcpyAsync(&Q_scale,  input_Q->scale_inv.dptr,  sizeof(float), cudaMemcpyDeviceToHost, stream);
+  if (input_K->scale_inv.dptr)
+    cudaMemcpyAsync(&K_scale,  input_K->scale_inv.dptr,  sizeof(float), cudaMemcpyDeviceToHost, stream);
+  if (input_dO->scale_inv.dptr)
+    cudaMemcpyAsync(&dO_scale, input_dO->scale_inv.dptr, sizeof(float), cudaMemcpyDeviceToHost, stream);
+  if (input_O->scale_inv.dptr)
+    cudaMemcpyAsync(&O_scale,  input_O->scale_inv.dptr,  sizeof(float), cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
-  // Invert: TE FP8 convention is x_fp8 = x_float / scale, so x_float = x_fp8 * scale
-  // (scale stores max_abs / 448, so dequantize = fp8_val * scale)
 
   // Pass 1: dQ — grid (S/BQ, H, B)
   {

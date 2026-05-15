@@ -24,6 +24,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "../common.h"
 #include "transformer_engine/fused_attn.h"
 #include "transformer_engine/transformer_engine.h"
 
