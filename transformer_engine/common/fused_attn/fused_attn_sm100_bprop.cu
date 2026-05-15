@@ -28,11 +28,6 @@
  * Fallback: NVTE_SM100_BPROP_DISABLE=1 → cuDNN knob_31.
  */
 
-// Enable CUTLASS SM90a wgmma intrinsics
-#ifndef CUTE_ARCH_MMA_SM90A_ENABLED
-#define CUTE_ARCH_MMA_SM90A_ENABLED
-#endif
-
 #include "fused_attn_sm100_bprop.h"
 #include "../common.h"
 #include "../util/system.h"
@@ -40,9 +35,7 @@
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
-// CUTLASS CuTe headers for wgmma
-#include "cute/arch/mma_sm90_gmma.hpp"
-#include "cute/arch/mma_sm90_desc.hpp"
+// No CUTLASS wgmma headers — use raw PTX to avoid synclog __device__-only conflicts.
 
 namespace transformer_engine {
 
@@ -64,47 +57,54 @@ static constexpr int ACC_PER_TILE = WG_M * BK / WG_SIZE;  // = 64
 static constexpr int ACC_PER_WG   = WG_M_TILES * ACC_PER_TILE; // = 128
 
 // ─── wgmma descriptor construction ─────────────────────────────────────────
-// For SM90 wgmma, shared-memory matrix descriptors encode:
-//   start_address (bits [13:4]) = smem_ptr >> 4
-//   leading_byte_offset (bits [29:16]) = row_stride_bytes >> 4
-//   stride_byte_offset (bits [45:32]) = 0 (unused for row-major 2D tiles)
-//   layout_type (bits [63:62]) = 0 (no swizzle)
+// SM90 shared-memory matrix descriptor (64-bit):
+//   bits [13:4]  = smem_ptr >> 4           (14-bit address)
+//   bits [29:16] = row_stride_bytes >> 4   (14-bit leading dimension)
+//   bits [63:62] = 0                        (SWIZZLE_NONE)
 __device__ __forceinline__ uint64_t
 make_wgmma_desc(const void* smem_ptr, int row_stride_bytes) {
-  cute::GmmaDescriptor desc{};
-  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  // start_address field stores addr >> 4 (14 bits)
-  desc.bitfield.start_address_       = static_cast<uint16_t>((addr >> 4) & 0x3FFF);
-  // leading_byte_offset stores stride >> 4 (14 bits)
-  desc.bitfield.leading_byte_offset_ = static_cast<uint16_t>((row_stride_bytes >> 4) & 0x3FFF);
-  desc.bitfield.stride_byte_offset_  = 0;
-  desc.bitfield.base_offset_         = 0;
-  desc.bitfield.layout_type_         = 0;  // SWIZZLE_NONE
-  return static_cast<uint64_t>(desc);
+  uint32_t addr  = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  uint64_t start = static_cast<uint64_t>((addr >> 4) & 0x3FFFu);
+  uint64_t stride = static_cast<uint64_t>((row_stride_bytes >> 4) & 0x3FFFu) << 16;
+  return start | stride;
 }
 
-// ─── wgmma call wrapper ─────────────────────────────────────────────────────
-// Wraps SM90::GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<1,1>::fma() which takes
-// 64 individual float references.  We use a float[64] array and expand via macro.
-//
-// Semantics: acc[64] += A[64,32] × B[128,32]^T   (B is transposed in the multiply)
-// Use for:  Q[64,K_stripe] × K[BK,K_stripe]^T = S[64,BK]
-#define WGMMA_CALL_SS_TN(acc, desc_a, desc_b, init)                                \
-  cute::SM90::GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<                              \
-      cute::GMMA::ScaleIn::One, cute::GMMA::ScaleIn::One>::fma(                    \
-      desc_a, desc_b,                                                               \
-      (acc)[0],  (acc)[1],  (acc)[2],  (acc)[3],  (acc)[4],  (acc)[5],            \
-      (acc)[6],  (acc)[7],  (acc)[8],  (acc)[9],  (acc)[10], (acc)[11],           \
-      (acc)[12], (acc)[13], (acc)[14], (acc)[15], (acc)[16], (acc)[17],           \
-      (acc)[18], (acc)[19], (acc)[20], (acc)[21], (acc)[22], (acc)[23],           \
-      (acc)[24], (acc)[25], (acc)[26], (acc)[27], (acc)[28], (acc)[29],           \
-      (acc)[30], (acc)[31], (acc)[32], (acc)[33], (acc)[34], (acc)[35],           \
-      (acc)[36], (acc)[37], (acc)[38], (acc)[39], (acc)[40], (acc)[41],           \
-      (acc)[42], (acc)[43], (acc)[44], (acc)[45], (acc)[46], (acc)[47],           \
-      (acc)[48], (acc)[49], (acc)[50], (acc)[51], (acc)[52], (acc)[53],           \
-      (acc)[54], (acc)[55], (acc)[56], (acc)[57], (acc)[58], (acc)[59],           \
-      (acc)[60], (acc)[61], (acc)[62], (acc)[63],                                   \
-      (init) ? cute::GMMA::ScaleOut::Zero : cute::GMMA::ScaleOut::One)
+// ─── wgmma raw PTX wrapper ──────────────────────────────────────────────────
+// wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3
+//   C[64,128] += A[64,32] × B[128,32]^T   (SS_TN: B in [N=128,K=32] layout)
+// init=true  → zero-initialize accumulators (scale_D=0)
+// init=false → accumulate into existing values (scale_D=1)
+#define WGMMA_SS_TN_m64n128k32_f32_e4m3(acc, desc_a, desc_b, init)                 \
+  do {                                                                               \
+    asm volatile(                                                                    \
+      "{\n"                                                                         \
+      ".reg .pred p;\n"                                                             \
+      "setp.ne.b32 p, %66, 0;\n"                                                   \
+      "wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3 "                    \
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                    \
+      "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"            \
+      "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"            \
+      "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63},"           \
+      "%64, %65, p, 0, 0;\n"                                                        \
+      "}\n"                                                                         \
+      : "+f"((acc)[ 0]),"+f"((acc)[ 1]),"+f"((acc)[ 2]),"+f"((acc)[ 3]),          \
+        "+f"((acc)[ 4]),"+f"((acc)[ 5]),"+f"((acc)[ 6]),"+f"((acc)[ 7]),          \
+        "+f"((acc)[ 8]),"+f"((acc)[ 9]),"+f"((acc)[10]),"+f"((acc)[11]),           \
+        "+f"((acc)[12]),"+f"((acc)[13]),"+f"((acc)[14]),"+f"((acc)[15]),           \
+        "+f"((acc)[16]),"+f"((acc)[17]),"+f"((acc)[18]),"+f"((acc)[19]),           \
+        "+f"((acc)[20]),"+f"((acc)[21]),"+f"((acc)[22]),"+f"((acc)[23]),           \
+        "+f"((acc)[24]),"+f"((acc)[25]),"+f"((acc)[26]),"+f"((acc)[27]),           \
+        "+f"((acc)[28]),"+f"((acc)[29]),"+f"((acc)[30]),"+f"((acc)[31]),           \
+        "+f"((acc)[32]),"+f"((acc)[33]),"+f"((acc)[34]),"+f"((acc)[35]),           \
+        "+f"((acc)[36]),"+f"((acc)[37]),"+f"((acc)[38]),"+f"((acc)[39]),           \
+        "+f"((acc)[40]),"+f"((acc)[41]),"+f"((acc)[42]),"+f"((acc)[43]),           \
+        "+f"((acc)[44]),"+f"((acc)[45]),"+f"((acc)[46]),"+f"((acc)[47]),           \
+        "+f"((acc)[48]),"+f"((acc)[49]),"+f"((acc)[50]),"+f"((acc)[51]),           \
+        "+f"((acc)[52]),"+f"((acc)[53]),"+f"((acc)[54]),"+f"((acc)[55]),           \
+        "+f"((acc)[56]),"+f"((acc)[57]),"+f"((acc)[58]),"+f"((acc)[59]),           \
+        "+f"((acc)[60]),"+f"((acc)[61]),"+f"((acc)[62]),"+f"((acc)[63])            \
+      : "l"(desc_a), "l"(desc_b), "r"((int)(!(init))));                            \
+  } while(0)
 
 // After each wgmma group, commit and wait for results
 __device__ __forceinline__ void wgmma_fence()   { asm volatile("wgmma.fence.sync.aligned;\n"); }
@@ -280,29 +280,30 @@ flash_attn_sm100_dQ(
       float S_acc[ACC_PER_TILE];
       for (int i = 0; i < ACC_PER_TILE; ++i) S_acc[i] = 0.f;
 
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+#if __CUDA_ARCH__ >= 900
       wgmma_fence();
       for (int k = 0; k < WG_K_TILES; ++k) {
         // A = Q[wg_m_row:wg_m_row+64, k*32:k*32+32], stride=HD (row-major)
         uint64_t desc_Q = make_wgmma_desc(&sm.Q[wg_m_row * HD + k * WG_K], HD);
-        // B = K[0:BK, k*32:k*32+32], B[n,k'] = K[n, k*32+k'], stride=HD between rows
-        // SS_TN: B stored as [N=BK, K=32] K-contiguous — exactly K's layout here
+        // B = K[0:BK, k*32:k*32+32] in [N=BK, K=32] row-major layout, stride=HD
         uint64_t desc_K = make_wgmma_desc(&sm.K[buf][k * WG_K], HD);
-        WGMMA_CALL_SS_TN(S_acc, desc_Q, desc_K, k == 0);
+        WGMMA_SS_TN_m64n128k32_f32_e4m3(S_acc, desc_Q, desc_K, k == 0);
       }
       wgmma_commit();
       wgmma_wait();
 #else
-      // Scalar fallback for non-SM90+ compilation
+      // Scalar fallback for non-SM90+ (correctness, no perf)
       for (int a = 0; a < ACC_PER_TILE; ++a) {
         int row_in_tile = (t_in_wg % 4) + (a / 4) * 4;
         int col         = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
                         + (a % 2) * 64 + ((a / 2) % 2) * 8;
-        float s = 0.f;
-        for (int c = 0; c < HD; ++c)
-          s += (float)sm.Q[(wg_m_row + row_in_tile) * HD + c] * Q_scale_val
-             * (float)sm.K[buf][col * HD + c] * K_scale_val;
-        S_acc[a] = s * attn_scale;
+        if (col < BK) {
+          float s = 0.f;
+          for (int c = 0; c < HD; ++c)
+            s += (float)sm.Q[(wg_m_row + row_in_tile) * HD + c] * Q_scale_val
+               * (float)sm.K[buf][col * HD + c] * K_scale_val;
+          S_acc[a] = s * attn_scale;
+        }
       }
 #endif
 
