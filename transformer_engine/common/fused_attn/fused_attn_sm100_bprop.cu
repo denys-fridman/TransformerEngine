@@ -90,7 +90,8 @@ make_wgmma_desc(const void* smem_ptr, int row_stride_bytes) {
 // Semantics: acc[64] += A[64,32] × B[128,32]^T   (B is transposed in the multiply)
 // Use for:  Q[64,K_stripe] × K[BK,K_stripe]^T = S[64,BK]
 #define WGMMA_CALL_SS_TN(acc, desc_a, desc_b, init)                                \
-  cute::SM90::GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<1,1>::fma(                    \
+  cute::SM90::GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<                              \
+      cute::GMMA::ScaleIn::One, cute::GMMA::ScaleIn::One>::fma(                    \
       desc_a, desc_b,                                                               \
       (acc)[0],  (acc)[1],  (acc)[2],  (acc)[3],  (acc)[4],  (acc)[5],            \
       (acc)[6],  (acc)[7],  (acc)[8],  (acc)[9],  (acc)[10], (acc)[11],           \
