@@ -79,30 +79,24 @@ void nvte_swiglu_nvfp4(const NVTETensor input, NVTETensor output, cudaStream_t s
   using namespace transformer_engine;
   const Tensor *input_t = convertNVTETensorCheck(input);
   Tensor *output_t = convertNVTETensorCheck(output);
-  // Null out amax pointers: the gated kernel uses per-block scaling only.
-  // Uninitialized amax.dptr from create_tensor() would corrupt the encode scale.
+  // Null out amax pointers only: uninitialized amax.dptr from create_tensor() would
+  // corrupt the per-block encode scale. We use pure per-block scaling (S_enc=1.0f).
+  // Keep columnwise_data intact — IS_GATED kernel writes both rowwise and columnwise
+  // in one pass (RETURN_TRANSPOSE=true when columnwise_data is allocated), which is
+  // needed for the backward wgrad GEMM. Clearing it would leave uninitialized memory
+  // that the backward pass reads → NaN gradients.
   void *saved_amax_row = output_t->amax.dptr;
   void *saved_amax_col = output_t->columnwise_amax.dptr;
   output_t->amax.dptr = nullptr;
   output_t->columnwise_amax.dptr = nullptr;
-  // Force rowwise-only output: disable columnwise (wgrad transpose) path.
-  // 2D quantization (enabled by default) allocates columnwise_data but the
-  // buffer may not match the gated output shape, causing corruption.
-  // The 2-step fallback handles 2D quant; this path is rowwise-only.
-  SimpleTensor saved_colwise_data = output_t->columnwise_data;
-  SimpleTensor saved_colwise_scale = output_t->columnwise_scale_inv;
-  output_t->columnwise_data = SimpleTensor{};         // clears dptr → return_transpose=false
-  output_t->columnwise_scale_inv = SimpleTensor{};
   // Empty noop (IS_GATED skips the early-exit noop check at compile time)
   Tensor dummy_noop{};
   QuantizationConfig quant_config{};  // default: no SR, no RNG
   dispatch::nvfp4::quantize_transpose_gated</*use_2d=*/false, Empty, silu<fp32, fp32>>(
       *input_t, &dummy_noop, output_t, &quant_config, stream);
-  // Restore all pointers
+  // Restore amax pointers
   output_t->amax.dptr = saved_amax_row;
   output_t->columnwise_amax.dptr = saved_amax_col;
-  output_t->columnwise_data = saved_colwise_data;
-  output_t->columnwise_scale_inv = saved_colwise_scale;
 }
 
 void nvte_swiglu(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
