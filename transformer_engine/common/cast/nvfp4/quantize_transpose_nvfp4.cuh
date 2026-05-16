@@ -1304,19 +1304,27 @@ void quantize_transpose(const Tensor &input, const Tensor *noop, Tensor *output,
       use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
 
       TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
-        auto kernel = quantize_transpose_nvfp4_kernel</*IS_GATED=*/false, COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
-                                                      USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
-
+        // Use if-constexpr branches to avoid type mismatch between 1D (has IS_GATED)
+        // and 2D (no IS_GATED) kernel templates.
         if constexpr (use_2d_quantization) {
-          kernel = quantize_transpose_nvfp4_2D_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
-                                                      USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
+          auto kernel2d = quantize_transpose_nvfp4_2D_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP,
+                                                             IType, USE_STOCHASTIC_ROUNDING,
+                                                             RETURN_TRANSPOSE>;
+          cudaFuncSetAttribute(kernel2d, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
+          kernel2d<<<grid, block_size, dshmem_size, stream>>>(
+              tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
+              scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
+              scale_stride, scale_stride_transpose, rng_state);
+        } else {
+          auto kernel1d = quantize_transpose_nvfp4_kernel</*IS_GATED=*/false, COMPUTE_ACTIVATIONS,
+                                                         ParamOP, OP, IType, USE_STOCHASTIC_ROUNDING,
+                                                         RETURN_TRANSPOSE>;
+          cudaFuncSetAttribute(kernel1d, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
+          kernel1d<<<grid, block_size, dshmem_size, stream>>>(
+              tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
+              scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
+              scale_stride, scale_stride_transpose, rng_state);
         }
-
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
-        kernel<<<grid, block_size, dshmem_size, stream>>>(
-            tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
-            scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
-            scale_stride, scale_stride_transpose, rng_state);
       }););
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
