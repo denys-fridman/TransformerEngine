@@ -79,11 +79,21 @@ void nvte_swiglu_nvfp4(const NVTETensor input, NVTETensor output, cudaStream_t s
   using namespace transformer_engine;
   const Tensor *input_t = convertNVTETensorCheck(input);
   Tensor *output_t = convertNVTETensorCheck(output);
-  // Empty noop tensor (IS_GATED path skips the noop early-exit check)
+  // Null out amax pointers: the gated kernel uses per-block scaling only
+  // (no pre-computed global amax). If these point to uninitialized memory
+  // from create_tensor(), garbage values would corrupt the encode scale.
+  void *saved_amax_row = output_t->amax.dptr;
+  void *saved_amax_col = output_t->columnwise_amax.dptr;
+  output_t->amax.dptr = nullptr;
+  output_t->columnwise_amax.dptr = nullptr;
+  // Empty noop (IS_GATED skips the early-exit noop check at compile time)
   Tensor dummy_noop{};
   QuantizationConfig quant_config{};  // default: no SR, no RNG
   dispatch::nvfp4::quantize_transpose_gated</*use_2d=*/false, Empty, silu<fp32, fp32>>(
       *input_t, &dummy_noop, output_t, &quant_config, stream);
+  // Restore amax pointers
+  output_t->amax.dptr = saved_amax_row;
+  output_t->columnwise_amax.dptr = saved_amax_col;
 }
 
 void nvte_swiglu(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
