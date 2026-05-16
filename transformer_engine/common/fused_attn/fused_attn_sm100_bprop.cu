@@ -5,26 +5,19 @@
  ************************************************************************/
 
 /*
- * Custom flash attention backward kernel for SM100 (GB200/Blackwell).
+ * Custom flash attention backward kernel.
  *
- * Step 2: replace scalar inner loops with wgmma tensor-core GEMMs.
+ * SM90 path: wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3 (SS_TN)
+ *   - 2 warp groups × 2 m64-tiles, accumulator in registers
  *
- * Key design:
- *   - BQ=256 tiles (vs cuDNN's 128) → 2× fewer LSE + K-tile loads from L2
- *   - wgmma m64n128k32 FP8→FP32 for Q@K^T and dS@K GEMMs
- *   - 256 threads = 2 warp groups; each WG owns BQ/2=128 rows (2 m64-tiles)
- *   - dQ accumulator in registers (128 floats/thread), persistent across KV loop
- *   - S (attention scores) written to shmem after wgmma for elementwise softmax
+ * SM100 path: tcgen05.mma.cta_group::1.kind::f8f6f4 M=128,N=128,K=32 (FP8→FP32 UMMA)
+ *   - One thread issues MMA; output to TMEM; warp-cooperative TMEM→shmem readback
+ *   - Tile 0: Q[0:128,:]×K^T → TMEM at tmem_base (col 0)
+ *   - Tile 1: Q[128:256,:]×K^T → TMEM at tmem_base+128 (col 128)
+ *   - Readback: tcgen05.ld.sync.aligned.16x256b.x4; warp W covers DPs W*16..W*16+15
+ *   - Register mapping: r=rep*4+f; dp=W*16+t1+(f>>1)*8; col=t0*2+(f&1)+rep*8+ci*32
  *
- * wgmma variant: SM90::GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<1,1>
- *   SS = both A and B from shared memory via descriptors
- *   TN = A in K-major layout (row-major for [M,K] tile),
- *        B in N-major layout (row-major for [N,K] tile, B is K-transposed in multiply)
- *   Computes:  C[64,128] += A[64,32] × B^T[32,128]  where B stored as [128,32]
- *   Used for:  Q[64,32] × K[128,32]^T  = S[64,128]  (attention scores)
- *              dS[64,32_packed] × K[128,32]^T ... see dQ step below
- *
- * Supports: SM90+, FP8 E4M3, no mask, D=128, S%256==0.
+ * Common: BQ=256 tiles, FP8 E4M3, D=128, S%256==0.
  * Fallback: NVTE_SM100_BPROP_DISABLE=1 → cuDNN knob_31.
  */
 
@@ -240,9 +233,23 @@ flash_attn_sm100_dQ(
 
   const int num_kv = (S + BK - 1) / BK;
 
-  // ── Single-pass KV loop: wgmma for S, scalar for dQ ──────────────────────
+#if __CUDA_ARCH__ >= 1000
+  // Allocate TMEM for 2 M=128×N=128 FP32 tiles (256 columns = 128 KB).
+  // One warp allocates; __syncthreads distributes the result to all threads.
+  __shared__ uint32_t tmem_base_sh;
+  if (threadIdx.x < 32) {
+    uint32_t dst = (uint32_t)__cvta_generic_to_shared(&tmem_base_sh);
+    asm volatile(
+      "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+      :: "r"(dst), "r"(256u));
+  }
+  __syncthreads();
+  const uint32_t tmem_base = tmem_base_sh;
+#endif
+
+  // ── Single-pass KV loop: GEMM for S, scalar for dQ ───────────────────────
   // Per KV block:
-  //   Phase A: both WGs run wgmma for their m64-tiles, write S to sm.S_wg (FP16)
+  //   Phase A: SM90 wgmma / SM100 UMMA → sm.S_wg (FP16, [N_WG][WG_ROWS*BK])
   //   Phase B: all 256 threads read S[my_qi,:] from sm.S_wg, accumulate dQ
   for (int kj = 0; kj < num_kv; ++kj) {
     const int kj_base = kj * BK;
@@ -271,54 +278,128 @@ flash_attn_sm100_dQ(
     }
     __syncthreads();
 
-    // ── Phase A: wgmma Q@K^T for all m64-tiles ────────────────────────────
-    // CLayout_64x128 register→(row,col) mapping:
-    //   row(t_in_wg, a) = (t_in_wg % 4) + (a / 4) * 4
-    //   col(t_in_wg, a) = ((t_in_wg/4)%8) + (t_in_wg/32)*16 + (a%2)*64 + ((a/2)%2)*8
+    // ── Phase A: Q@K^T → sm.S_wg[N_WG][WG_ROWS*BK] (FP16) ───────────────────
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 905
+    // SM90: wgmma m64n128k32, 2 WGs × 2 m64-tiles each
     for (int m = 0; m < WG_M_TILES; ++m) {
-      const int wg_m_row = wg_row_base + m * WG_M;  // global row start for this tile
-
+      const int wg_m_row = wg_row_base + m * WG_M;
       float S_acc[ACC_PER_TILE];
       for (int i = 0; i < ACC_PER_TILE; ++i) S_acc[i] = 0.f;
-
-#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 905
       wgmma_fence();
       for (int k = 0; k < WG_K_TILES; ++k) {
-        // A = Q[wg_m_row:wg_m_row+64, k*32:k*32+32], stride=HD (row-major)
         uint64_t desc_Q = make_wgmma_desc(&sm.Q[wg_m_row * HD + k * WG_K], HD);
-        // B = K[0:BK, k*32:k*32+32] in [N=BK, K=32] row-major layout, stride=HD
         uint64_t desc_K = make_wgmma_desc(&sm.K[buf][k * WG_K], HD);
         WGMMA_SS_TN_m64n128k32_f32_e4m3(S_acc, desc_Q, desc_K, k == 0);
       }
       wgmma_commit();
       wgmma_wait();
-#else
-      // Scalar fallback for SM100+ (Blackwell uses UMMA, not wgmma; correctness only)
       for (int a = 0; a < ACC_PER_TILE; ++a) {
         int row_in_tile = (t_in_wg % 4) + (a / 4) * 4;
-        int col         = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
-                        + (a % 2) * 64 + ((a / 2) % 2) * 8;
-        if (col < BK) {
-          float s = 0.f;
-          for (int c = 0; c < HD; ++c)
-            s += (float)sm.Q[(wg_m_row + row_in_tile) * HD + c] * Q_scale_val
-               * (float)sm.K[buf][col * HD + c] * K_scale_val;
-          S_acc[a] = s * attn_scale;
-        }
-      }
-#endif
-
-      // Write S_acc to sm.S_wg (FP16) at the correct (row, col) position.
-      // S_wg layout: [BQ, BK] FP16, indexed as [(wg_m_row + row_in_tile), col].
-      for (int a = 0; a < ACC_PER_TILE; ++a) {
-        int row_in_tile = (t_in_wg % 4) + (a / 4) * 4;
-        int col         = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
-                        + (a % 2) * 64 + ((a / 2) % 2) * 8;
+        int col = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
+                + (a % 2) * 64 + ((a / 2) % 2) * 8;
         float s_val = S_acc[a] * (Q_scale_val * K_scale_val * attn_scale);
         sm.S_wg[wg_id][(m * WG_M + row_in_tile) * BK + col] = __float2half(s_val);
       }
-    }  // end m-tile loop
-    __syncthreads();  // ensure all S_wg writes are visible
+    }
+
+#elif __CUDA_ARCH__ >= 1000
+    // SM100: tcgen05.mma.cta_group::1.kind::f8f6f4 (FP8→FP32 UMMA)
+    // InstrDescriptor: E4M3 A, E4M3 B, F32 C, M=128, N=128, K-major A+B.
+    //   c_format=F32(1)→bits[5:4]=0x10; n_dim=N/8=16→16<<17=0x200000;
+    //   m_dim=M/16=8→8<<24=0x8000000  ⟹  desc=0x08200010
+    static constexpr uint32_t UMMA_IDESC = 0x08200010u;
+    // Issue 2 M=128 tiles over WG_K_TILES=4 K-tiles (K=32 each)
+    for (int k = 0; k < WG_K_TILES; ++k) {
+      uint64_t desc_Q0   = make_wgmma_desc(&sm.Q[0   * HD + k * WG_K], HD);
+      uint64_t desc_Q128 = make_wgmma_desc(&sm.Q[128 * HD + k * WG_K], HD);
+      uint64_t desc_K_   = make_wgmma_desc(&sm.K[buf][k * WG_K], HD);
+      uint32_t accum = (k != 0) ? 1u : 0u;  // 0=init/clear C, 1=accumulate
+      if (threadIdx.x == 0) {
+        // Tile 0: TMEM rows 0-127 at tmem_base
+        asm volatile(
+          "{\n\t .reg .pred p;\n\t setp.ne.b32 p,%4,0;\n\t"
+          "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0],%1,%2,%3,{0,0,0,0},p;\n\t}\n"
+          :: "r"(tmem_base),"l"(desc_Q0),"l"(desc_K_),
+             "r"(UMMA_IDESC),"r"(accum) : "memory");
+        // Tile 1: TMEM rows 0-127 at tmem_base+128 (col offset 128)
+        asm volatile(
+          "{\n\t .reg .pred p;\n\t setp.ne.b32 p,%4,0;\n\t"
+          "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0],%1,%2,%3,{0,0,0,0},p;\n\t}\n"
+          :: "r"(tmem_base + 128u),"l"(desc_Q128),"l"(desc_K_),
+             "r"(UMMA_IDESC),"r"(accum) : "memory");
+      }
+    }
+    // CTA-wide commit + implicit barrier
+    asm volatile("tcgen05.commit.cta_group::1.sync.aligned;\n" ::: "memory");
+    // TMEM→shmem: warp W covers DPs [W*16, W*16+16), 4 rounds × 32 cols = 128 cols.
+    // Thread mapping for tcgen05.ld.sync.aligned.16x256b.x4.b32:
+    //   lane=T%32, t0=lane%4, t1=lane/4; register r=rep*4+f, rep∈[0,4), f∈[0,4)
+    //   dp  = W*16 + t1 + (f>>1)*8    (→ S row in [0,128))
+    //   col = t0*2 + (f&1) + rep*8 + ci*32  (→ S col in [0,128))
+    {
+      const int warp_id = threadIdx.x / 32;
+      const int lane    = threadIdx.x % 32;
+      const int t0 = lane % 4, t1 = lane / 4;
+      const float qk_scale = Q_scale_val * K_scale_val * attn_scale;
+      const uint32_t wdp = (uint32_t)(warp_id * 16) << 16;
+      for (int ci = 0; ci < 4; ++ci) {
+        const uint32_t coff = (uint32_t)(ci * 32);
+        uint32_t s0[16], s1[16];
+        asm volatile(
+          "tcgen05.ld.sync.aligned.16x256b.x4.b32 "
+          "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15},[%16];\n"
+          : "=r"(s0[0]),"=r"(s0[1]),"=r"(s0[2]),"=r"(s0[3]),
+            "=r"(s0[4]),"=r"(s0[5]),"=r"(s0[6]),"=r"(s0[7]),
+            "=r"(s0[8]),"=r"(s0[9]),"=r"(s0[10]),"=r"(s0[11]),
+            "=r"(s0[12]),"=r"(s0[13]),"=r"(s0[14]),"=r"(s0[15])
+          : "r"(tmem_base + wdp + coff));
+        asm volatile(
+          "tcgen05.ld.sync.aligned.16x256b.x4.b32 "
+          "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15},[%16];\n"
+          : "=r"(s1[0]),"=r"(s1[1]),"=r"(s1[2]),"=r"(s1[3]),
+            "=r"(s1[4]),"=r"(s1[5]),"=r"(s1[6]),"=r"(s1[7]),
+            "=r"(s1[8]),"=r"(s1[9]),"=r"(s1[10]),"=r"(s1[11]),
+            "=r"(s1[12]),"=r"(s1[13]),"=r"(s1[14]),"=r"(s1[15])
+          : "r"(tmem_base + 128u + wdp + coff));
+        asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
+        for (int rep = 0; rep < 4; ++rep) {
+          for (int f = 0; f < 4; ++f) {
+            const int r   = rep * 4 + f;
+            const int dp  = warp_id * 16 + t1 + (f >> 1) * 8;
+            const int col = t0 * 2 + (f & 1) + rep * 8 + ci * 32;
+            sm.S_wg[0][dp * BK + col] = __float2half(__uint_as_float(s0[r]) * qk_scale);
+            sm.S_wg[1][dp * BK + col] = __float2half(__uint_as_float(s1[r]) * qk_scale);
+          }
+        }
+      }
+    }
+
+#else
+    // Generic scalar fallback (for unsupported architectures; correctness only)
+    for (int m = 0; m < WG_M_TILES; ++m) {
+      const int wg_m_row = wg_row_base + m * WG_M;
+      float S_acc[ACC_PER_TILE];
+      for (int a = 0; a < ACC_PER_TILE; ++a) {
+        int row_in_tile = (t_in_wg % 4) + (a / 4) * 4;
+        int col = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
+                + (a % 2) * 64 + ((a / 2) % 2) * 8;
+        float s = 0.f;
+        if (col < BK)
+          for (int c = 0; c < HD; ++c)
+            s += (float)sm.Q[(wg_m_row + row_in_tile) * HD + c]
+               * (float)sm.K[buf][col * HD + c];
+        S_acc[a] = s * attn_scale;
+      }
+      for (int a = 0; a < ACC_PER_TILE; ++a) {
+        int row_in_tile = (t_in_wg % 4) + (a / 4) * 4;
+        int col = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
+                + (a % 2) * 64 + ((a / 2) % 2) * 8;
+        float s_val = S_acc[a] * (Q_scale_val * K_scale_val * attn_scale);
+        sm.S_wg[wg_id][(m * WG_M + row_in_tile) * BK + col] = __float2half(s_val);
+      }
+    }
+#endif
+    __syncthreads();  // ensure all S_wg writes visible before Phase B
 
     // ── Phase B: scalar dQ (one row per thread, reads S from sm.S_wg) ──────
     if (seq_qi < S) {
@@ -347,6 +428,15 @@ flash_attn_sm100_dQ(
     }
     __syncthreads();
   }  // end KV loop
+
+#if __CUDA_ARCH__ >= 1000
+  // Release TMEM allocation (warp 0)
+  if (threadIdx.x < 32) {
+    asm volatile(
+      "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+      :: "r"(tmem_base), "r"(256u));
+  }
+#endif
 
   // ── Store dQ ─────────────────────────────────────────────────────────────
   float my_amax = 0.f;
