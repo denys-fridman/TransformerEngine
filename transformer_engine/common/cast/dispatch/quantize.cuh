@@ -90,44 +90,53 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       break;
     }
     case NVTE_NVFP4_1D_SCALING: {
-      NVTE_CHECK(!IS_ACT, "IS_ACT is not supported by FWD NVTE_NVFP4_1D_SCALING");
-
-      // Check tensors
-      CheckNoopTensor(*noop_tensor, "cast_noop");
-      CheckInputTensor(*input_tensor, "input");
-      CheckOutputTensor(*output_tensor, "output", false);
-
-      // Choose kernel
-      int32_t rows = input_tensor->flat_first_dim();
-      int32_t cols = input_tensor->flat_last_dim();
-      auto dtype = input_tensor->dtype();
-      bool use_optimized_kernel = (dtype == DType::kBFloat16) && (rows % 32 == 0) &&
-                                  (cols % 32 == 0) && output_tensor->has_data();
-
-      // Launch NVFP4 quantize kernel
-      if (use_optimized_kernel) {
-        if (quant_config_cpp.nvfp4_2d_quantization) {
-          nvfp4::quantize_transpose</*use_2d_quantization=*/true>(
-              *input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
-        } else {
-          nvfp4::quantize_transpose</*use_2d_quantization*/ false>(
-              *input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
-        }
+      if constexpr (IS_ACT) {
+        // IS_ACT=true → fused gated activation (SwiGLU) + NVFP4 quantize.
+        // Input: [M, 2N] (gate || up);  Output: [M, N] FP4  via OP(gate)*up.
+        // Only supported for BF16 inputs that are 32-row/col aligned.
+        CheckNoopTensor(*noop_tensor, "cast_noop");
+        CheckInputTensor(*input_tensor, "input");
+        CheckOutputTensor(*output_tensor, "output", false);
+        nvfp4::quantize_transpose_gated</*use_2d_quantization=*/false, ParamOP, OP>(
+            *input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
       } else {
-        auto &global_amax = (output_tensor->amax.dptr != nullptr) ? output_tensor->amax
-                                                                  : output_tensor->columnwise_amax;
-        quantize_transpose_vector_blockwise_fp4(
-            /*input=*/input_tensor->data, /*global_amax=*/global_amax,
-            /*scale_inv=*/output_tensor->scale_inv,
-            /*scale_inv_t=*/output_tensor->columnwise_scale_inv,
-            /*output=*/output_tensor->data, /*output_t=*/output_tensor->columnwise_data,
-            /*epsilon=*/0.0f, /*return_identity=*/output_tensor->has_data(),
-            /*return_transpose=*/output_tensor->has_columnwise_data(), /*pow2_scale=*/false,
-            /*swizzled_scale=*/false,
-            /*use_stochastic_rounding=*/quant_config_cpp.stochastic_rounding,
-            /*rng_state=*/quant_config_cpp.rng_state,
-            /*use_2d_quantization=*/quant_config_cpp.nvfp4_2d_quantization,
-            /*noop_tensor=*/noop_tensor->data, /*stream=*/stream);
+        // Check tensors
+        CheckNoopTensor(*noop_tensor, "cast_noop");
+        CheckInputTensor(*input_tensor, "input");
+        CheckOutputTensor(*output_tensor, "output", false);
+
+        // Choose kernel
+        int32_t rows = input_tensor->flat_first_dim();
+        int32_t cols = input_tensor->flat_last_dim();
+        auto dtype = input_tensor->dtype();
+        bool use_optimized_kernel = (dtype == DType::kBFloat16) && (rows % 32 == 0) &&
+                                    (cols % 32 == 0) && output_tensor->has_data();
+
+        // Launch NVFP4 quantize kernel
+        if (use_optimized_kernel) {
+          if (quant_config_cpp.nvfp4_2d_quantization) {
+            nvfp4::quantize_transpose</*use_2d_quantization=*/true>(
+                *input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
+          } else {
+            nvfp4::quantize_transpose</*use_2d_quantization*/ false>(
+                *input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
+          }
+        } else {
+          auto &global_amax = (output_tensor->amax.dptr != nullptr) ? output_tensor->amax
+                                                                    : output_tensor->columnwise_amax;
+          quantize_transpose_vector_blockwise_fp4(
+              /*input=*/input_tensor->data, /*global_amax=*/global_amax,
+              /*scale_inv=*/output_tensor->scale_inv,
+              /*scale_inv_t=*/output_tensor->columnwise_scale_inv,
+              /*output=*/output_tensor->data, /*output_t=*/output_tensor->columnwise_data,
+              /*epsilon=*/0.0f, /*return_identity=*/output_tensor->has_data(),
+              /*return_transpose=*/output_tensor->has_columnwise_data(), /*pow2_scale=*/false,
+              /*swizzled_scale=*/false,
+              /*use_stochastic_rounding=*/quant_config_cpp.stochastic_rounding,
+              /*rng_state=*/quant_config_cpp.rng_state,
+              /*use_2d_quantization=*/quant_config_cpp.nvfp4_2d_quantization,
+              /*noop_tensor=*/noop_tensor->data, /*stream=*/stream);
+        }
       }
       break;
     }

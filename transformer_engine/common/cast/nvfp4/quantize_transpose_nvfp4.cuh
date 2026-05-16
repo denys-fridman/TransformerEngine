@@ -107,8 +107,15 @@ constexpr size_t TOTAL_BANKS_WIDTH = (32 * 4 * 8) / 4;  // 256
 // Number of threads (rowwise scaling) that span 32 banks (4-byte banks) of shared memory
 constexpr size_t THREADS_PER_BANK = TOTAL_BANKS_WIDTH / SCALE_DIM;  // 8 = 128 / 16
 
-template <bool COMPUTE_ACTIVATIONS, typename ParamOP, float (*OP)(float, const ParamOP &),
-          typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE>
+// IS_GATED=true: fused SwiGLU + NVFP4 quantize.
+//   tensor_map_input  = gate half  [M, N], stride = 2N (first N columns of [M,2N])
+//   tensor_map_up     = up   half  [M, N], stride = 2N (last  N columns of [M,2N])
+//   output shape      = [M, N]     (half of the input columns)
+//   computation:  elt = OP(gate_elt, {}) * up_elt   (e.g. silu(gate) * up for SwiGLU)
+// IS_GATED=false: identical to the original single-input path.
+template <bool IS_GATED, bool COMPUTE_ACTIVATIONS, typename ParamOP,
+          float (*OP)(float, const ParamOP &), typename IType, bool USE_STOCHASTIC_ROUNDING,
+          bool RETURN_TRANSPOSE>
 __global__ void __launch_bounds__(THREADS_NUM)
     quantize_transpose_nvfp4_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                                     const __grid_constant__ CUtensorMap tensor_map_output,
@@ -118,14 +125,15 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                     const float *const amax_rowwise_ptr,
                                     const float *const amax_colwise_ptr, const size_t rows,
                                     const size_t cols, const size_t scale_stride,
-                                    const size_t scale_stride_t, const size_t *rng_state) {
+                                    const size_t scale_stride_t, const size_t *rng_state,
+                                    const __grid_constant__ CUtensorMap tensor_map_up = {}) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
-      (!COMPUTE_ACTIVATIONS) && (!std::is_same_v<IType, float>);
+      (!COMPUTE_ACTIVATIONS) && (!IS_GATED) && (!std::is_same_v<IType, float>);
 
   using IType2 = typename ptx::FPx2<IType>;
 
-  if constexpr (!COMPUTE_ACTIVATIONS) {
+  if constexpr (!COMPUTE_ACTIVATIONS && !IS_GATED) {
     if (noop != nullptr && noop[0] == 1.0f) {
       return;
     }
@@ -141,7 +149,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
   // Index of the random number. It increments each time when used and resets to 0 if reaches 4x
   int rnd_idx = 0;
 
-  constexpr bool IS_CACHED_ACT_OP = COMPUTE_ACTIVATIONS;
+  constexpr bool IS_CACHED_ACT_OP = COMPUTE_ACTIVATIONS || IS_GATED;
 
   const size_t block_offset_Y = blockIdx.y * CHUNK_DIM_Y;
   const size_t block_offset_X = blockIdx.x * CHUNK_DIM_X;
@@ -207,16 +215,22 @@ __global__ void __launch_bounds__(THREADS_NUM)
   uintptr_t dshmem = (base_shmem_ptr + TMA_SHMEM_ALIGNMENT - 1) &
                      ~(static_cast<uintptr_t>(TMA_SHMEM_ALIGNMENT - 1));
 
-  // The destination shared memory buffer of a bulk tensor operation should be 16-byte aligned
+  // IS_GATED: up_sh immediately follows in_sh. Launcher allocates extra in_mem
+  // bytes of dynamic shmem; output/scale buffers are shifted past the up_sh region.
+  constexpr size_t gated_in_offset = IS_GATED ? in_mem : 0;
   IType *in_sh = reinterpret_cast<IType *>(dshmem);
-  fp4e2m1x2 *out_data_sh = reinterpret_cast<fp4e2m1x2 *>(dshmem + in_mem);
-  fp4e2m1x2 *out_t_data_sh = reinterpret_cast<fp4e2m1x2 *>(dshmem + in_mem + out_mem_rowwise_data);
+  IType *up_sh = IS_GATED ? reinterpret_cast<IType *>(dshmem + in_mem) : nullptr;
+  fp4e2m1x2 *out_data_sh =
+      reinterpret_cast<fp4e2m1x2 *>(dshmem + in_mem + gated_in_offset);
+  fp4e2m1x2 *out_t_data_sh = reinterpret_cast<fp4e2m1x2 *>(
+      dshmem + in_mem + gated_in_offset + out_mem_rowwise_data);
 
   nvfp4_scale_t *out_rowwise_scales_sh = reinterpret_cast<nvfp4_scale_t *>(
-      dshmem + in_mem + out_mem_rowwise_data + out_mem_colwise_data);
+      dshmem + in_mem + gated_in_offset + out_mem_rowwise_data + out_mem_colwise_data);
   nvfp4_scale_t *out_colwise_scales_sh = reinterpret_cast<nvfp4_scale_t *>(
-      dshmem + in_mem + out_mem_rowwise_data + out_mem_colwise_data + out_mem_rowwise_scales);
-  IType *cached_act_sh = in_sh;  // in_sh is used as a cache buffer
+      dshmem + in_mem + gated_in_offset + out_mem_rowwise_data + out_mem_colwise_data
+      + out_mem_rowwise_scales);
+  IType *cached_act_sh = in_sh;  // reused as activation cache after colwise pass
 
   constexpr size_t shmem_buff_size = buff_size_aligned_in / BUFFS_NUM;
 
@@ -242,8 +256,14 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   initialize_barriers<STAGES, THREADS_NUM>(mbar, is_master_thread);
 
-  copy_2d_to_shared(&in_sh[0], &tensor_map_input, block_offset_X, block_offset_Y, shmem_buff_size,
-                    &mbar[0], is_master_thread);
+  if constexpr (IS_GATED) {
+    copy_2d_to_sharedx2(&in_sh[0], &tensor_map_input, block_offset_X, block_offset_Y,
+                        &up_sh[0], &tensor_map_up, block_offset_X, block_offset_Y,
+                        shmem_buff_size, &mbar[0], is_master_thread);
+  } else {
+    copy_2d_to_shared(&in_sh[0], &tensor_map_input, block_offset_X, block_offset_Y,
+                      shmem_buff_size, &mbar[0], is_master_thread);
+  }
 
 #pragma unroll
   for (size_t stage = 0; stage < STAGES; ++stage) {
@@ -266,8 +286,15 @@ __global__ void __launch_bounds__(THREADS_NUM)
       const size_t global_offset_X = block_offset_X;
       const size_t next_buff_offset = next_buff * BUFF_IN_SIZE;
 
-      copy_2d_to_shared(&in_sh[next_buff_offset], &tensor_map_input, global_offset_X,
-                        global_offset_Y, shmem_buff_size, &mbar[next_stage], is_master_thread);
+      if constexpr (IS_GATED) {
+        copy_2d_to_sharedx2(&in_sh[next_buff_offset], &tensor_map_input, global_offset_X,
+                            global_offset_Y, &up_sh[next_buff_offset], &tensor_map_up,
+                            global_offset_X, global_offset_Y, shmem_buff_size,
+                            &mbar[next_stage], is_master_thread);
+      } else {
+        copy_2d_to_shared(&in_sh[next_buff_offset], &tensor_map_input, global_offset_X,
+                          global_offset_Y, shmem_buff_size, &mbar[next_stage], is_master_thread);
+      }
     }
 
     ptx::fence_proxy_async_shared_cta();
@@ -310,7 +337,10 @@ __global__ void __launch_bounds__(THREADS_NUM)
           for (int i = 0; i < SCALE_DIM; ++i) {
             const int shmem_offset_colwise = shmem_offset_base_colwise_in + i * BUFF_IN_DIM_X;
             float elt = static_cast<float>(in_sh[shmem_offset_colwise]);
-            if constexpr (COMPUTE_ACTIVATIONS) {
+            if constexpr (IS_GATED) {
+              float up_elt = static_cast<float>(up_sh[shmem_offset_colwise]);
+              elt = OP(elt, {}) * up_elt;  // silu(gate) * up
+            } else if constexpr (COMPUTE_ACTIVATIONS) {
               elt = OP(elt, {});
             }
             // Numerical truncation: Downcast to IType (BF16/FP16), then upcast it back to FP32
@@ -321,7 +351,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
             if constexpr (IS_CACHED_ACT_OP) {
               cached_act_sh[shmem_offset_colwise] = static_cast<IType>(elt);
             }
-            if constexpr (COMPUTE_ACTIVATIONS) {
+            if constexpr (COMPUTE_ACTIVATIONS || IS_GATED) {
               const bool row_out_of_bounds_colwise =
                   (row_base_colwise + stage_offset_Y + i >= rows);
               const bool out_of_bounds = (col_out_of_bounds_colwise || row_out_of_bounds_colwise);
@@ -478,19 +508,24 @@ __global__ void __launch_bounds__(THREADS_NUM)
             Vec<IType, PACK_SIZE> act_in;
 
             in.load_from(&in_sh[shmem_offset_rowwise]);
+            Vec<IType, PACK_SIZE> up_in;
+            if constexpr (IS_GATED) up_in.load_from(&up_sh[shmem_offset_rowwise]);
 #pragma unroll
             for (int e = 0; e < PACK_SIZE; ++e) {
               const size_t j = w * PACK_SIZE + e;
               // Compute element
               float elt = static_cast<float>(in.data.elt[e]);
-              if constexpr (COMPUTE_ACTIVATIONS) {
+              if constexpr (IS_GATED) {
+                float up_elt = static_cast<float>(up_in.data.elt[e]);
+                elt = OP(elt, {}) * up_elt;  // silu(gate) * up
+              } else if constexpr (COMPUTE_ACTIVATIONS) {
                 elt = OP(elt, {});
               }
               // Numerical truncation: Downcast to IType (BF16/FP16), then upcast it back to FP32
               if constexpr (!std::is_same_v<IType, float>) {
                 elt = static_cast<float>(static_cast<IType>(elt));
               }
-              if constexpr (COMPUTE_ACTIVATIONS) {
+              if constexpr (COMPUTE_ACTIVATIONS || IS_GATED) {
                 const bool row_out_of_bounds_rowwise = (row_base_rowwise + it_offset_Y >= rows);
                 const bool swizzled_col_out_of_bounds =
                     (block_offset_X + swizzled_thread_idx >= cols);
@@ -1269,7 +1304,7 @@ void quantize_transpose(const Tensor &input, const Tensor *noop, Tensor *output,
       use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
 
       TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
-        auto kernel = quantize_transpose_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
+        auto kernel = quantize_transpose_nvfp4_kernel</*IS_GATED=*/false, COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
                                                       USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
 
         if constexpr (use_2d_quantization) {
@@ -1286,6 +1321,117 @@ void quantize_transpose(const Tensor &input, const Tensor *noop, Tensor *output,
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
 #endif  // FP4_TYPE_SUPPORTED
+}
+
+
+template <bool use_2d_quantization, typename ParamOP, float (*OP)(float, const ParamOP &)>
+void quantize_transpose_gated(const Tensor &input, const Tensor *noop, Tensor *output,
+                               const QuantizationConfig *quant_config, cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  using namespace quantize_transpose_kernel;
+  using namespace ptx;
+
+  // For gated (SwiGLU) quantize: input is [M, 2N], output is [M, N].
+  // Gate half: input[:, 0:N]; Up half: input[:, N:2N].
+  // Operation: output[i,j] = OP(gate[i,j], {}) * up[i,j].
+  bool return_transpose = output->has_columnwise_data();
+  bool use_stochastic_rounding = quant_config ? quant_config->stochastic_rounding : false;
+
+  // Gated path always uses TMA kernel (tuned_1D doesn't support two inputs).
+  checkCuDriverContext(stream);
+  CheckNoopTensor(*noop, "cast_noop");
+  CheckInputTensor(input, "input");
+  CheckOutputTensor(*output, "output", false);
+
+  NVTE_CHECK(input.has_data(), "Cannot quantize tensor without rowwise data.");
+  NVTE_CHECK(output->has_data(), "NVFP4 output tensor must be allocated.");
+  NVTE_CHECK(is_fp4_dtype(output->data.dtype), "Output must have FP4 type.");
+  NVTE_CHECK(output->scale_inv.dptr != nullptr, "Scaling tensor must be allocated.");
+  NVTE_CHECK(!output->with_gemm_swizzled_scales, "Output must have scales in compact format.");
+
+  const size_t rows = input.flat_first_dim();
+  const size_t input_cols = input.flat_last_dim();  // = 2*N
+  NVTE_CHECK(input_cols % 2 == 0, "IS_GATED requires even number of input columns.");
+  const size_t N = input_cols / 2;  // output cols = N (gate half-width)
+
+  NVTE_CHECK(rows % 32 == 0, "Rows must be multiple of 32 for TMA alignment.");
+  NVTE_CHECK(N % 32 == 0, "N (half-width) must be multiple of 32 for TMA alignment.");
+
+  const size_t blocks_Y = DIVUP(rows, CHUNK_DIM_Y);
+  const size_t blocks_X = DIVUP(N, CHUNK_DIM_X);
+  const dim3 grid(blocks_X, blocks_Y);
+  const size_t block_size = THREADS_NUM;
+
+  const size_t scale_stride = output->scale_inv.shape[1];
+  const size_t scale_stride_transpose = return_transpose ? output->columnwise_scale_inv.shape[1] : 0;
+  nvfp4_scale_t *const scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output->scale_inv.dptr);
+  nvfp4_scale_t *const scales_t_ptr =
+      reinterpret_cast<nvfp4_scale_t *>(output->columnwise_scale_inv.dptr);
+  const float *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
+  const float *const amax_rowwise_ptr = reinterpret_cast<const float *>(output->amax.dptr);
+  const float *const amax_colwise_ptr =
+      reinterpret_cast<const float *>(output->columnwise_amax.dptr);
+
+  const NVTETensor rng_state_tensor = (quant_config != nullptr) ? quant_config->rng_state : nullptr;
+  const size_t *rng_state = nullptr;
+  if (rng_state_tensor != nullptr) {
+    Tensor &rng_state_te = *convertNVTETensor(rng_state_tensor);
+    rng_state = reinterpret_cast<const size_t *>(rng_state_te.data.dptr);
+  }
+
+  using IType = bf16;
+
+  // Gate TMA: first N columns of [M, 2N] input.  stride = input_cols (full row width).
+  alignas(64) CUtensorMap tensor_map_gate{};
+  create_2D_tensor_map(tensor_map_gate, input.data, rows, N, BUFF_DIM_Y, BUFF_DIM_X,
+                       input_cols, /*offset_elems=*/0, sizeof(IType) * 8);
+
+  // Up TMA: second N columns.  offset_elems = N shifts the start pointer by N elements.
+  alignas(64) CUtensorMap tensor_map_up{};
+  create_2D_tensor_map(tensor_map_up, input.data, rows, N, BUFF_DIM_Y, BUFF_DIM_X,
+                       input_cols, /*offset_elems=*/N, sizeof(IType) * 8);
+
+  alignas(64) CUtensorMap tensor_map_output{};
+  create_2D_tensor_map(tensor_map_output, output->data, rows, N, BUFF_DIM_Y, BUFF_DIM_X, N, 0, 4);
+
+  alignas(64) CUtensorMap tensor_map_output_t{};
+  if (return_transpose) {
+    create_2D_tensor_map(tensor_map_output_t, output->columnwise_data, N, rows,
+                         BUFF_DIM_X, BUFF_DIM_Y, rows, 0, 4);
+  }
+
+  constexpr size_t buff_elems = BUFF_DIM_Y * BUFF_IN_DIM_X;
+  constexpr size_t buff_elems_total = BUFFS_NUM * buff_elems;
+  constexpr size_t buff_size_aligned_in =
+      DIVUP_TO_MULTIPLE(buff_elems_total * sizeof(IType), TMA_SHMEM_ALIGNMENT);
+  constexpr size_t buff_size_aligned_out =
+      DIVUP_TO_MULTIPLE((buff_elems_total * 4) / 8, TMA_SHMEM_ALIGNMENT);
+  constexpr size_t buff_size_scales = (CHUNK_DIM_Y * CHUNK_DIM_X) / 16 * sizeof(nvfp4_scale_t);
+  constexpr size_t in_mem = buff_size_aligned_in;
+  constexpr size_t out_data_mem = buff_size_aligned_out;
+  constexpr size_t out_data_t_mem = buff_size_aligned_out;
+  constexpr size_t out_scales_t_mem = buff_size_scales;
+  constexpr size_t out_mem = out_data_mem + out_data_t_mem;
+  // IS_GATED needs 2*in_mem (gate_sh + up_sh) before output buffers.
+  constexpr size_t dshmem_size = 2 * in_mem + out_mem + out_scales_t_mem + TMA_SHMEM_ALIGNMENT;
+
+  TRANSFORMER_ENGINE_SWITCH_CONDITION(
+      use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
+      TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
+        // IS_GATED=true; use_2d_quantization only for the IS_GATED=false 2D path; here unused.
+        auto kernel =
+            quantize_transpose_nvfp4_kernel</*IS_GATED=*/true, /*COMPUTE_ACTIVATIONS=*/true,
+                                            ParamOP, OP, IType, USE_STOCHASTIC_ROUNDING,
+                                            RETURN_TRANSPOSE>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);
+        kernel<<<grid, block_size, dshmem_size, stream>>>(
+            tensor_map_gate, tensor_map_output, tensor_map_output_t, scales_ptr, scales_t_ptr,
+            noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, N, scale_stride,
+            scale_stride_transpose, rng_state, tensor_map_up);
+      }););
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif
 }
 
 }  // namespace nvfp4
