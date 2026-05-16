@@ -85,7 +85,7 @@ make_wgmma_desc(const void* smem_ptr, int row_stride_bytes) {
       "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"            \
       "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"            \
       "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63},"           \
-      "%64, %65, p, 0, 0;\n"                                                        \
+      "%64, %65, p, 1, 1;\n"                                                        \
       "}\n"                                                                         \
       : "+f"((acc)[ 0]),"+f"((acc)[ 1]),"+f"((acc)[ 2]),"+f"((acc)[ 3]),          \
         "+f"((acc)[ 4]),"+f"((acc)[ 5]),"+f"((acc)[ 6]),"+f"((acc)[ 7]),          \
@@ -106,10 +106,14 @@ make_wgmma_desc(const void* smem_ptr, int row_stride_bytes) {
       : "l"(desc_a), "l"(desc_b), "r"((int)(!(init))));                            \
   } while(0)
 
-// After each wgmma group, commit and wait for results
-__device__ __forceinline__ void wgmma_fence()   { asm volatile("wgmma.fence.sync.aligned;\n"); }
-__device__ __forceinline__ void wgmma_commit()  { asm volatile("wgmma.commit_group.sync.aligned;\n"); }
-__device__ __forceinline__ void wgmma_wait()    { asm volatile("wgmma.wait_group.sync.aligned 0;\n"); }
+// SM90 (Hopper) wgmma barrier instructions.
+// SM100 (Blackwell) uses UMMA instead — wgmma not available on sm_100a.
+// We gate our wgmma path to SM90 only; SM100 uses the scalar fallback.
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 905
+__device__ __forceinline__ void wgmma_fence()  { asm volatile("wgmma.fence.sync.aligned;\n"); }
+__device__ __forceinline__ void wgmma_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n"); }
+__device__ __forceinline__ void wgmma_wait()   { asm volatile("wgmma.wait_group.sync.aligned 0;\n"); }
+#endif
 
 // ────────────────────────── shared memory layout ─────────────────────────────
 // Tiles for wgmma path.  S stored as FP16 to fit in 228 KB:
@@ -183,9 +187,6 @@ flash_attn_sm100_dQ(
   // Note: lambdas inside __global__ cannot be annotated __device__; annotation is implicit.
   auto gptr = [&](const __nv_fp8_e4m3* base, int qi) {
     return base + bi * S * stride + qi * stride + hi * HD;
-  };
-  auto gptr_k = [&](const __nv_fp8_e4m3* base, int ki) {
-    return base + bi * S * stride + ki * stride + hi * HD;
   };
 
   // ── Load Q, dO, O tiles ──────────────────────────────────────────────────
@@ -280,7 +281,7 @@ flash_attn_sm100_dQ(
       float S_acc[ACC_PER_TILE];
       for (int i = 0; i < ACC_PER_TILE; ++i) S_acc[i] = 0.f;
 
-#if __CUDA_ARCH__ >= 900
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 905
       wgmma_fence();
       for (int k = 0; k < WG_K_TILES; ++k) {
         // A = Q[wg_m_row:wg_m_row+64, k*32:k*32+32], stride=HD (row-major)
@@ -292,7 +293,7 @@ flash_attn_sm100_dQ(
       wgmma_commit();
       wgmma_wait();
 #else
-      // Scalar fallback for non-SM90+ (correctness, no perf)
+      // Scalar fallback for SM100+ (Blackwell uses UMMA, not wgmma; correctness only)
       for (int a = 0; a < ACC_PER_TILE; ++a) {
         int row_in_tile = (t_in_wg % 4) + (a / 4) * 4;
         int col         = ((t_in_wg / 4) % 8) + (t_in_wg / 32) * 16
