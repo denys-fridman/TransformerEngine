@@ -6,6 +6,7 @@
 
 #include "../util/math.h"
 #include "./activation_template.h"
+#include "../cast/nvfp4/quantize_transpose_nvfp4.cuh"
 
 void nvte_silu(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
   NVTE_API_CALL(nvte_silu);
@@ -67,6 +68,22 @@ void nvte_group_quantize_dbias_dsilu(const NVTEGroupedTensor input,
 
   dispatch::group_quantize_bwd_helper<IS_DBIAS, IS_DACT, Empty, dsilu<fp32, fp32>>(
       input, activation_input, output, dbias, workspace, nullptr, stream);
+}
+
+// Fused SwiGLU + NVFP4 quantize in a single TMA kernel pass.
+// input:  [M, 2N] BF16 (gate || up concatenated along last dim)
+// output: [M, N]  NVFP4 with rowwise (and optional columnwise) scale factors
+// Computation: output[i,j] = silu(input[i,j]) * input[i,j+N]  then quantize to NVFP4.
+void nvte_swiglu_nvfp4(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_swiglu_nvfp4);
+  using namespace transformer_engine;
+  const Tensor *input_t = convertNVTETensorCheck(input);
+  Tensor *output_t = convertNVTETensorCheck(output);
+  // Empty noop tensor (IS_GATED path skips the noop early-exit check)
+  Tensor dummy_noop{};
+  QuantizationConfig quant_config{};  // default: no SR, no RNG
+  dispatch::nvfp4::quantize_transpose_gated</*use_2d=*/false, Empty, silu<fp32, fp32>>(
+      *input_t, &dummy_noop, output_t, &quant_config, stream);
 }
 
 void nvte_swiglu(const NVTETensor input, NVTETensor output, cudaStream_t stream) {

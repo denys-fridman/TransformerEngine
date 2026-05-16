@@ -321,6 +321,18 @@ void nvte_geglu(const NVTETensor input, NVTETensor output, cudaStream_t stream);
  */
 void nvte_swiglu(const NVTETensor input, NVTETensor output, cudaStream_t stream);
 
+/*! \brief Fused SwiGLU activation + NVFP4 quantize in a single TMA kernel pass.
+ *
+ *  Input shape:  [M, 2N] BF16  (gate || up concatenated along last dim)
+ *  Output shape: [M, N] NVFP4  (rowwise scale_inv; columnwise if allocated)
+ *  Formula: output[i,j] = silu(input[i,j]) * input[i, j+N], then quantize to NVFP4.
+ *
+ *  \param[in]     input     Input tensor [M, 2N] BF16
+ *  \param[in,out] output    Output NVFP4 tensor [M, N] with scale_inv allocated
+ *  \param[in]     stream    CUDA stream
+ */
+void nvte_swiglu_nvfp4(const NVTETensor input, NVTETensor output, cudaStream_t stream);
+
 /*! \brief Computes the gated Swish activation of the input used in GPT OSS.
  *
  *        See https://github.com/openai/gpt-oss/blob/a0a84273e9e0c14a233cb9befdfd159c2bcfa6cd/gpt_oss/torch/model.py#L250

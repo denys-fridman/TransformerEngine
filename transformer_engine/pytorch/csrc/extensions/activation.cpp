@@ -32,7 +32,13 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   auto [out_nvte, out_py] = quantizer_cpp->create_tensor(output_shape, fake_dtype);
 
   // Choose implementation
-  enum class Impl { UNFUSED, FULLY_FUSED, FUSED_ACTIVATION_AMAX_FP8, FUSED_ACTIVATION_AMAX_NVFP4 };
+  enum class Impl {
+    UNFUSED,
+    FULLY_FUSED,
+    FUSED_ACTIVATION_AMAX_FP8,
+    FUSED_ACTIVATION_AMAX_NVFP4,
+    FUSED_GATED_NVFP4,  // single-pass SwiGLU+NVFP4 (C2): no BF16 intermediate
+  };
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || detail::IsFloat8Quantizers(quantizer.ptr()) ||
       detail::IsMXFP8Quantizers(quantizer.ptr())) {
@@ -43,13 +49,14 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
     auto nvfp4_quantizer_cpp = dynamic_cast<NVFP4Quantizer*>(quantizer_cpp.get());
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
     if (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax) {
-      // Post-RHT amax is handled within NVFP4 quantizer
       impl = Impl::UNFUSED;
+    } else if (shape_divisor == 2) {
+      // Gated activation: fused single-pass SwiGLU+NVFP4, no BF16 intermediate
+      impl = Impl::FUSED_GATED_NVFP4;
     } else {
       impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
     }
   }
-
   // Perform compute
   auto stream = at::cuda::getCurrentCUDAStream();
   switch (impl) {
@@ -115,6 +122,16 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
           }
         });
         nvfp4_quantizer_cpp->quantize_with_amax(temp_nvte, out_nvte);
+      }
+      break;
+    case Impl::FUSED_GATED_NVFP4:
+      // Single-pass fused SwiGLU + NVFP4 quantize.
+      // Reads [M, 2N] BF16 input directly; writes [M, N] NVFP4 output with no BF16 temp.
+      // Only valid for gated activations (shape_divisor == 2, i.e. SwiGLU).
+      {
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_swiglu_nvfp4(input_nvte.data(), out_nvte.data(), stream);
+        });
       }
       break;
     default:
