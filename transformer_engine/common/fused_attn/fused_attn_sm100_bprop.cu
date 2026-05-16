@@ -315,22 +315,26 @@ flash_attn_sm100_dQ(
       uint64_t desc_K_   = make_wgmma_desc(&sm.K[buf][k * WG_K], HD);
       uint32_t accum = (k != 0) ? 1u : 0u;  // 0=init/clear C, 1=accumulate
       if (threadIdx.x == 0) {
+        // Mask operands must be registers (not inline literals) per PTX ISA
+        const uint32_t m0=0u, m1=0u, m2=0u, m3=0u;
         // Tile 0: TMEM rows 0-127 at tmem_base
         asm volatile(
           "{\n\t .reg .pred p;\n\t setp.ne.b32 p,%4,0;\n\t"
-          "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0],%1,%2,%3,{0,0,0,0},p;\n\t}\n"
+          "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0],%1,%2,%3,{%5,%6,%7,%8},p;\n\t}\n"
           :: "r"(tmem_base),"l"(desc_Q0),"l"(desc_K_),
-             "r"(UMMA_IDESC),"r"(accum) : "memory");
+             "r"(UMMA_IDESC),"r"(accum),"r"(m0),"r"(m1),"r"(m2),"r"(m3) : "memory");
         // Tile 1: TMEM rows 0-127 at tmem_base+128 (col offset 128)
         asm volatile(
           "{\n\t .reg .pred p;\n\t setp.ne.b32 p,%4,0;\n\t"
-          "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0],%1,%2,%3,{0,0,0,0},p;\n\t}\n"
+          "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0],%1,%2,%3,{%5,%6,%7,%8},p;\n\t}\n"
           :: "r"(tmem_base + 128u),"l"(desc_Q128),"l"(desc_K_),
-             "r"(UMMA_IDESC),"r"(accum) : "memory");
+             "r"(UMMA_IDESC),"r"(accum),"r"(m0),"r"(m1),"r"(m2),"r"(m3) : "memory");
       }
     }
-    // CTA-wide commit + implicit barrier
-    asm volatile("tcgen05.commit.cta_group::1.sync.aligned;\n" ::: "memory");
+    // Wait for all pending TMEM stores (from MMA) to complete, then sync all threads.
+    // tcgen05.commit is not a valid PTX instruction; use tcgen05.wait::st instead.
+    asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory");
+    __syncthreads();
     // TMEM→shmem: warp W covers DPs [W*16, W*16+16), 4 rounds × 32 cols = 128 cols.
     // Thread mapping for tcgen05.ld.sync.aligned.16x256b.x4.b32:
     //   lane=T%32, t0=lane%4, t1=lane/4; register r=rep*4+f, rep∈[0,4), f∈[0,4)
