@@ -50,10 +50,10 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
     if (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax) {
       impl = Impl::UNFUSED;
-    } else if (shape_divisor == 2) {
-      // Gated activation: fused single-pass SwiGLU+NVFP4, no BF16 intermediate
-      impl = Impl::FUSED_GATED_NVFP4;
     } else {
+      // FUSED_GATED_NVFP4 disabled: IS_GATED kernel has S_enc bug (wrong scale without global amax).
+      // Fall back to correct 2-step path: BF16 temp → quantize_with_amax.
+      impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
       impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
     }
   }
