@@ -1354,7 +1354,9 @@ void quantize_transpose(const Tensor &input, const Tensor *noop, Tensor *output,
               tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
               scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
               scale_stride, scale_stride_transpose, rng_state,
-              /*tensor_map_up=*/{});
+              /*tensor_map_up=*/{},
+              /*second_stage_scale_ptr=*/nullptr,
+              /*global_amax_out_ptr=*/nullptr);
         }
       }););
 #else
