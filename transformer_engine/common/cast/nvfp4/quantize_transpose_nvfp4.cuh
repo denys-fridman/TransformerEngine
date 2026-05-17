@@ -126,7 +126,11 @@ __global__ void __launch_bounds__(THREADS_NUM)
                                     const float *const amax_colwise_ptr, const size_t rows,
                                     const size_t cols, const size_t scale_stride,
                                     const size_t scale_stride_t, const size_t *rng_state,
-                                    const __grid_constant__ CUtensorMap tensor_map_up = {}) {
+                                    const __grid_constant__ CUtensorMap tensor_map_up = {},
+                                    // second_stage_scale: used for S_enc=1.0/scale (matches non-TMA path)
+                                    const float *const second_stage_scale_ptr = nullptr,
+                                    // global_amax_out: write reduced amax for next-step scale update
+                                    float *const global_amax_out_ptr = nullptr) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
       (!COMPUTE_ACTIVATIONS) && (!IS_GATED) && (!std::is_same_v<IType, float>);
@@ -237,8 +241,12 @@ __global__ void __launch_bounds__(THREADS_NUM)
   const bool is_master_thread = (threadIdx.x == 0);
 
   // Compute a global encoding/decoding scaling factors for all S_dec_b
-  const float S_enc_rowwise = (amax_rowwise_ptr == nullptr)
-                                  ? 1.0f
+  // S_enc: prefer second_stage_scale_ptr (= 1/S_enc, from delayed recipe) over raw amax
+  const float S_enc_rowwise = (second_stage_scale_ptr != nullptr)
+      ? 1.0f / (*second_stage_scale_ptr)
+      : ((amax_rowwise_ptr == nullptr)
+             ? 1.0f
+             : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr));
                                   : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr);
   // NOTE: This is to match with how emulation code was written.
   const float S_dec_rowwise = 1.0 / S_enc_rowwise;
@@ -650,6 +658,28 @@ __global__ void __launch_bounds__(THREADS_NUM)
   }
 
   destroy_barriers<STAGES>(mbar, is_master_thread);
+
+  // Write global amax for delayed-scaling recipe: needed so compute_nvfp4_per_tensor_scale_kernel
+  // can update output->scale.dptr for the NEXT step's S_enc computation.
+  if (global_amax_out_ptr != nullptr) {
+    // Warp reduction of thread_amax
+    for (int mask = 16; mask > 0; mask >>= 1)
+      thread_amax = fmaxf(thread_amax, __shfl_xor_sync(0xFFFFFFFF, thread_amax, mask));
+    // Block reduction via shared memory (one slot per warp)
+    constexpr int N_WARPS = THREADS_NUM / THREADS_PER_WARP;
+    __shared__ float shmem_amax[N_WARPS];
+    const int warp_id = threadIdx.x / THREADS_PER_WARP;
+    const int lane_id = threadIdx.x % THREADS_PER_WARP;
+    if (lane_id == 0) shmem_amax[warp_id] = thread_amax;
+    __syncthreads();
+    if (warp_id == 0) {
+      float val = (lane_id < N_WARPS) ? shmem_amax[lane_id] : 0.0f;
+      for (int mask = 16; mask > 0; mask >>= 1)
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, mask));
+      if (lane_id == 0)
+        atomicMax(reinterpret_cast<unsigned int*>(global_amax_out_ptr), __float_as_uint(val));
+    }
+  }
 #else
   NVTE_DEVICE_ERROR("sm_100 or higher is required.");
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -1380,6 +1410,15 @@ void quantize_transpose_gated(const Tensor &input, const Tensor *noop, Tensor *o
   const float *const amax_rowwise_ptr = reinterpret_cast<const float *>(output->amax.dptr);
   const float *const amax_colwise_ptr =
       reinterpret_cast<const float *>(output->columnwise_amax.dptr);
+  // second_stage_scale: = global_amax/(fp8_max*fp4_max) from delayed recipe.
+  // S_enc = 1.0/second_stage_scale — matches the non-TMA quantize_nvfp4 path.
+  const float *const second_stage_scale_ptr =
+      reinterpret_cast<const float *>(output->scale.dptr);
+  // global_amax_out: write kernel-computed amax for next step's scale update.
+  float *const global_amax_out_ptr = reinterpret_cast<float *>(output->amax.dptr);
+  if (global_amax_out_ptr != nullptr) {
+    NVTE_CHECK_CUDA(cudaMemsetAsync(global_amax_out_ptr, 0, sizeof(float), stream));
+  }
 
   const NVTETensor rng_state_tensor = (quant_config != nullptr) ? quant_config->rng_state : nullptr;
   const size_t *rng_state = nullptr;
@@ -1436,7 +1475,8 @@ void quantize_transpose_gated(const Tensor &input, const Tensor *noop, Tensor *o
         kernel<<<grid, block_size, dshmem_size, stream>>>(
             tensor_map_gate, tensor_map_output, tensor_map_output_t, scales_ptr, scales_t_ptr,
             noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, N, scale_stride,
-            scale_stride_transpose, rng_state, tensor_map_up);
+            scale_stride_transpose, rng_state, tensor_map_up,
+            second_stage_scale_ptr, global_amax_out_ptr);
       }););
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);

@@ -79,24 +79,16 @@ void nvte_swiglu_nvfp4(const NVTETensor input, NVTETensor output, cudaStream_t s
   using namespace transformer_engine;
   const Tensor *input_t = convertNVTETensorCheck(input);
   Tensor *output_t = convertNVTETensorCheck(output);
-  // Null out amax pointers only: uninitialized amax.dptr from create_tensor() would
-  // corrupt the per-block encode scale. We use pure per-block scaling (S_enc=1.0f).
-  // Keep columnwise_data intact — IS_GATED kernel writes both rowwise and columnwise
-  // in one pass (RETURN_TRANSPOSE=true when columnwise_data is allocated), which is
-  // needed for the backward wgrad GEMM. Clearing it would leave uninitialized memory
-  // that the backward pass reads → NaN gradients.
-  void *saved_amax_row = output_t->amax.dptr;
-  void *saved_amax_col = output_t->columnwise_amax.dptr;
-  output_t->amax.dptr = nullptr;
-  output_t->columnwise_amax.dptr = nullptr;
-  // Empty noop (IS_GATED skips the early-exit noop check at compile time)
+  // Pass all pointers through naturally:
+  // - output->scale.dptr: second-stage scale = global_amax/(fp8_max*fp4_max) from delayed recipe
+  //   → kernel uses this for S_enc = 1.0/scale (matches non-TMA quantize_nvfp4 path)
+  // - output->amax.dptr: kernel zeroes this, then writes the computed global amax
+  //   → enables compute_nvfp4_per_tensor_scale_kernel to update scale.dptr for next step
+  // - output->columnwise_data: kernel writes both rowwise+columnwise NVFP4 for wgrad GEMM
   Tensor dummy_noop{};
   QuantizationConfig quant_config{};  // default: no SR, no RNG
   dispatch::nvfp4::quantize_transpose_gated</*use_2d=*/false, Empty, silu<fp32, fp32>>(
       *input_t, &dummy_noop, output_t, &quant_config, stream);
-  // Restore amax pointers
-  output_t->amax.dptr = saved_amax_row;
-  output_t->columnwise_amax.dptr = saved_amax_col;
 }
 
 void nvte_swiglu(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
