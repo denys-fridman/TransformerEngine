@@ -247,7 +247,6 @@ __global__ void __launch_bounds__(THREADS_NUM)
       : ((amax_rowwise_ptr == nullptr)
              ? 1.0f
              : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr));
-                                  : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr);
   // NOTE: This is to match with how emulation code was written.
   const float S_dec_rowwise = 1.0 / S_enc_rowwise;
 
