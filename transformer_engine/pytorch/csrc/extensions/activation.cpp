@@ -50,10 +50,10 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
     NVTE_CHECK(nvfp4_quantizer_cpp != nullptr, "Could not cast to NVFP4 quantizer");
     if (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax) {
       impl = Impl::UNFUSED;
-    } else {
-      // FUSED_GATED_NVFP4 disabled: TMA kernel overhead exceeds savings.
-      // Needs tuned_1D gated kernel for actual speedup.
-      impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
+    } else if (shape_divisor == 2) {
+      // Fused gated SwiGLU+NVFP4: uses second_stage_scale_ptr for correct S_enc.
+      // Overhead reduced: no cudaMemsetAsync, no atomic amax write-back.
+      impl = Impl::FUSED_GATED_NVFP4;
       impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
     }
   }

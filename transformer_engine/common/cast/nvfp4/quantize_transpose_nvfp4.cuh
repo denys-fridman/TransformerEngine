@@ -1411,15 +1411,11 @@ void quantize_transpose_gated(const Tensor &input, const Tensor *noop, Tensor *o
   const float *const amax_rowwise_ptr = reinterpret_cast<const float *>(output->amax.dptr);
   const float *const amax_colwise_ptr =
       reinterpret_cast<const float *>(output->columnwise_amax.dptr);
-  // second_stage_scale: = global_amax/(fp8_max*fp4_max) from delayed recipe.
-  // S_enc = 1.0/second_stage_scale — matches the non-TMA quantize_nvfp4 path.
+  // second_stage_scale: S_enc = 1.0/scale matches non-TMA path (delayed recipe).
+  // global_amax_out: skipped — stale amax acceptable for delayed scaling,
+  // avoids cudaMemsetAsync overhead + atomic reduction in hot path.
   const float *const second_stage_scale_ptr =
       reinterpret_cast<const float *>(output->scale.dptr);
-  // global_amax_out: write kernel-computed amax for next step's scale update.
-  float *const global_amax_out_ptr = reinterpret_cast<float *>(output->amax.dptr);
-  if (global_amax_out_ptr != nullptr) {
-    NVTE_CHECK_CUDA(cudaMemsetAsync(global_amax_out_ptr, 0, sizeof(float), stream));
-  }
 
   const NVTETensor rng_state_tensor = (quant_config != nullptr) ? quant_config->rng_state : nullptr;
   const size_t *rng_state = nullptr;
@@ -1477,7 +1473,7 @@ void quantize_transpose_gated(const Tensor &input, const Tensor *noop, Tensor *o
             tensor_map_gate, tensor_map_output, tensor_map_output_t, scales_ptr, scales_t_ptr,
             noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, N, scale_stride,
             scale_stride_transpose, rng_state, tensor_map_up,
-            second_stage_scale_ptr, global_amax_out_ptr);
+            second_stage_scale_ptr, /*global_amax_out_ptr=*/nullptr);
       }););
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
