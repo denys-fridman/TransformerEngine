@@ -95,6 +95,7 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
         row_scaled_nvfp4: bool = False,
         nvfp4_use_4over6: bool = False,
         nvfp4_e4m3_max: int = 448,
+        high_precision_data: Optional[torch.Tensor] = None,
     ):
         if (
             shapes is not None
@@ -170,6 +171,7 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             row_scaled_nvfp4=row_scaled_nvfp4,
             nvfp4_use_4over6=nvfp4_use_4over6,
             nvfp4_e4m3_max=nvfp4_e4m3_max,
+            high_precision_data=high_precision_data,
         )
         return instance
 
@@ -195,6 +197,7 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             dst.first_dims = src.first_dims
             dst.last_dims = src.last_dims
             dst.tensor_offsets = src.tensor_offsets
+            dst.high_precision_data = src.high_precision_data
             dst.offsets = src.offsets
             dst.scale_inv_offsets = src.scale_inv_offsets
             dst.columnwise_scale_inv_offsets = src.columnwise_scale_inv_offsets

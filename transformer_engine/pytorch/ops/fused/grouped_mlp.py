@@ -2073,19 +2073,25 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         fc2_dy = None
         if isinstance(grad_output, GroupedTensor):
             # Grad output arrived already quantized (e.g. FP8 token dispatch): reuse its rowwise
-            # data for the dgrad GEMM. Bias grads are reduced from the dequantized grad, which is
-            # only materialized when one is needed. A grad that is already GEMM-ready in both
-            # directions passes through untouched.
+            # data for the dgrad GEMM. Bias grads are reduced from the high-precision grad when
+            # the producer kept it, else from the dequantized grad, which is only materialized
+            # when one is needed. A grad that is already GEMM-ready in both directions passes
+            # through untouched.
             grouped_fc2_dy = grad_output.copy()
-            fc2_dy = tex.group_requantize_inplace(
+            fc2_dy = grad_output.high_precision_data
+            if fc2_dy is not None:
+                fc2_dy = fc2_dy.view(out_shape)
+            dequantized_fc2_dy = tex.group_requantize_inplace(
                 grouped_fc2_dy,
                 fc2_grad_output_quantizer,
                 num_groups,
                 split_sizes,
                 TE_DType[dtype],
                 tensor_offsets=fc2_out_tensor_offsets,
-                return_dequantized=output_fc2_dbias or scale_bias,
+                return_dequantized=(output_fc2_dbias or scale_bias) and fc2_dy is None,
             )
+            if fc2_dy is None:
+                fc2_dy = dequantized_fc2_dy
             if output_fc2_dbias and not scale_bias:
                 # This path has no quantize kernel to fuse dbias into, and the consumer below
                 # has no fallback, so reduce it here.

@@ -1775,18 +1775,24 @@ class GroupedLinear(BasicOperation):
             )
             if prequantized_grad:
                 # Grad output arrived already quantized (e.g. FP8 token dispatch): reuse its
-                # rowwise data for the dgrad GEMM. Bias grads are reduced from the dequantized
-                # grad below, which is only kept when there is a bias.
+                # rowwise data for the dgrad GEMM. Bias grads are reduced below from the
+                # high-precision grad when the producer kept it, else from the dequantized
+                # grad, which is only kept when there is a bias.
                 grouped_dy = grad_output.copy()
-                dy_2d = tex.group_requantize_inplace(
+                dy_2d = grad_output.high_precision_data
+                if dy_2d is not None:
+                    dy_2d = dy_2d.view(total_tokens, self.out_features)
+                dequantized_dy = tex.group_requantize_inplace(
                     grouped_dy,
                     grad_output_quantizer,
                     num_groups,
                     split_sizes,
                     TE_DType[dtype],
                     tensor_offsets=output_tensor_offsets,
-                    return_dequantized=has_bias,
+                    return_dequantized=has_bias and dy_2d is None,
                 )
+                if dy_2d is None:
+                    dy_2d = dequantized_dy
             elif has_bias and not self._scale_bias and fuse_bgrad:
                 grouped_dy, dbias_packed = tex.bgrad_group_quantize(
                     dy_2d,

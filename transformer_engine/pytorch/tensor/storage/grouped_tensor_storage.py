@@ -76,6 +76,7 @@ class GroupedTensorStorage:
         row_scaled_nvfp4: bool = False,
         nvfp4_use_4over6: bool = False,
         nvfp4_e4m3_max: int = 448,
+        high_precision_data: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Initialize a GroupedTensor.
@@ -98,6 +99,9 @@ class GroupedTensorStorage:
             tensor_offsets: Device tensor of int64 array of length num_tensors+1 (CSR-style,
                 or None if uniform). offsets[i] = start of tensor i, offsets[num_tensors] = total.
             offsets: Vector of integer offsets for each tensor.
+            high_precision_data: The values of the rowwise data before quantization (1D
+                flattened, in dtype), when the producer keeps them for consumers that need
+                high precision alongside the quantized data, e.g. bias gradients.
         """
         # `requires_grad` and `stride` are accepted for API symmetry with
         # GroupedTensor.__new__ but are not relevant for storage-only
@@ -118,6 +122,7 @@ class GroupedTensorStorage:
         instance.amax = amax
         instance.columnwise_amax = columnwise_amax
         instance.scale = scale
+        instance.high_precision_data = high_precision_data
 
         # For convenient indexing for python GroupedTensor API.
         instance.scale_inv_offsets = scale_inv_offsets
@@ -182,6 +187,7 @@ class GroupedTensorStorage:
         row_scaled_nvfp4: bool = False,
         nvfp4_use_4over6: bool = False,
         nvfp4_e4m3_max: int = 448,
+        high_precision_data: Optional[torch.Tensor] = None,
     ):
         instance = object.__new__(cls)
         cls._initialize_storage_fields(
@@ -210,6 +216,7 @@ class GroupedTensorStorage:
             row_scaled_nvfp4=row_scaled_nvfp4,
             nvfp4_use_4over6=nvfp4_use_4over6,
             nvfp4_e4m3_max=nvfp4_e4m3_max,
+            high_precision_data=high_precision_data,
         )
         return instance
 
@@ -358,6 +365,7 @@ class GroupedTensorStorage:
             self.first_dims,
             self.last_dims,
             self.tensor_offsets,
+            self.high_precision_data,
         ]
         self.rowwise_data = None
         self.columnwise_data = None
@@ -369,6 +377,7 @@ class GroupedTensorStorage:
         self.first_dims = None
         self.last_dims = None
         self.tensor_offsets = None
+        self.high_precision_data = None
         self.quantized_tensors = None
         return tensors, self
 
@@ -386,7 +395,8 @@ class GroupedTensorStorage:
         self.first_dims = tensors[7]
         self.last_dims = tensors[8]
         self.tensor_offsets = tensors[9]
-        return tensors[10:]
+        self.high_precision_data = tensors[10]
+        return tensors[11:]
 
     def get_data_tensors(self):
         """Get tensor fields that may be saved or offloaded."""
@@ -401,6 +411,7 @@ class GroupedTensorStorage:
             self.first_dims,
             self.last_dims,
             self.tensor_offsets,
+            self.high_precision_data,
         )
 
     def clear(self) -> None:
@@ -417,6 +428,7 @@ class GroupedTensorStorage:
         self.first_dims = None
         self.last_dims = None
         self.tensor_offsets = None
+        self.high_precision_data = None
         self.logical_shape = (0, 0)
         self.num_tensors = 0
         self.quantizer = None
@@ -613,6 +625,7 @@ class GroupedTensorStorage:
             row_scaled_nvfp4=self.row_scaled_nvfp4,
             nvfp4_use_4over6=self.nvfp4_use_4over6,
             nvfp4_e4m3_max=self.nvfp4_e4m3_max,
+            high_precision_data=self.high_precision_data,
         )
 
     @staticmethod
