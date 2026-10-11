@@ -69,7 +69,7 @@ try:
     import cutlass.utils.rubin_helpers as sm107_utils
 except ImportError:
     sm107_utils = None
-from cutlass.cute.typing import Int32, Float32, Float8E4M3FN, Boolean
+from cutlass.cute.typing import Int32, Float32, Boolean
 
 from transformer_engine.common.CuTeDSL.attention import fmha_helpers as fmha_utils
 
