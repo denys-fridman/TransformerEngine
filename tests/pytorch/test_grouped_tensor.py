@@ -20,6 +20,7 @@ from transformer_engine.pytorch import (
     MXFP8Quantizer,
     NVFP4Quantizer,
 )
+from transformer_engine.pytorch.constants import MXFP8_BLOCK_SCALING_SIZE
 from transformer_engine.pytorch.utils import is_non_tn_fp8_gemm_supported, mark_grouped_tensor
 import transformer_engine_torch as tex
 
@@ -717,6 +718,60 @@ class TestGroupedTensor:
         if output_dbias:
             expected_dbias = torch.stack([t.sum(dim=0) for t in input_tensors])
             torch.testing.assert_close(dbias, expected_dbias, rtol=1e-5, atol=4e-3)
+
+    @pytest.mark.parametrize("usage", ["rowwise", "columnwise", "both"])
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_quantize_grouped_mxfp8_uniform_partial_chunk(self, usage: str) -> None:
+        """Uniform tensors whose row count is not a multiple of the 128-row kernel chunk.
+
+        The last chunk of every tensor must stop at that tensor's last row: the rows after
+        it belong to the next tensor, or to nobody for the last tensor, whose scales would
+        otherwise be written past the end of the scale buffers.
+        """
+        num_tensors, rows, cols = 4, 160, 512
+        input_tensors = [
+            torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") for _ in range(num_tensors)
+        ]
+        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
+        quantizer.set_usage(rowwise=usage != "columnwise", columnwise=usage != "rowwise")
+
+        grouped_output = tex.group_quantize(
+            torch.cat(input_tensors, dim=0), quantizer, num_tensors, None
+        )
+        references = [quantizer(tensor) for tensor in input_tensors]
+
+        # The grouped buffers hold the tensors back to back, while each per-tensor reference
+        # pads its scales to whole [128, 4] / [4, 128] tiles: compare the unpadded rows.
+        if quantizer.rowwise_usage:
+            data = grouped_output.rowwise_data.view(num_tensors, rows, cols)
+            scale_inv = grouped_output.scale_inv.view(num_tensors, rows, -1)
+            for idx, ref in enumerate(references):
+                assert torch.equal(data[idx], ref._rowwise_data)
+                assert torch.equal(scale_inv[idx], ref._rowwise_scale_inv[:rows])
+        if quantizer.columnwise_usage:
+            scale_rows = rows // MXFP8_BLOCK_SCALING_SIZE
+            data = grouped_output.columnwise_data.view(num_tensors, rows, cols)
+            scale_inv = grouped_output.columnwise_scale_inv.view(num_tensors, scale_rows, -1)
+            for idx, ref in enumerate(references):
+                assert torch.equal(data[idx], ref._columnwise_data)
+                assert torch.equal(scale_inv[idx], ref._columnwise_scale_inv[:scale_rows])
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_quantize_grouped_mxfp8_uniform_rejects_misaligned_rows(self) -> None:
+        """Uniform tensors must hold whole 32-row scaling blocks, and whole 128-row chunks
+        when the bias gradient is reduced per chunk."""
+        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
+        quantizer.set_usage(rowwise=True, columnwise=False)
+
+        # 8 x 48 rows: the stacked 384 rows are 128-aligned, the tensors are not 32-aligned.
+        grouped_input = torch.randn(8 * 48, 512, dtype=torch.bfloat16, device="cuda")
+        with pytest.raises(RuntimeError, match="divisible by 32"):
+            tex.group_quantize(grouped_input, quantizer, 8, None)
+
+        # 4 x 160 rows quantize fine (see above) but cannot reduce dbias per 128-row chunk.
+        grouped_input = torch.randn(4 * 160, 512, dtype=torch.bfloat16, device="cuda")
+        with pytest.raises(RuntimeError, match="divisible by 128"):
+            tex.bgrad_group_quantize(grouped_input, quantizer, 4, None, None)
 
     @pytest.mark.parametrize("output_dbias", [False, True])
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
