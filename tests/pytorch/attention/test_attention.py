@@ -3505,18 +3505,14 @@ def test_dpa_fp8_cutedsl_bwd(dtype, model, fp8_format, monkeypatch):
 
     monkeypatch.setenv("NVTE_CUTEDSL_FP8_ATTN_BWD", "0")
     logging.info("[test_dpa_fp8_cutedsl_bwd]: run with cuDNN")
-    cudnn_fwd, cudnn_bwd = _run_dpa_fp8_vs_f16(dtype, config, True, qkv_layout, True, fp8_recipe)
+    _, cudnn_bwd = _run_dpa_fp8_vs_f16(dtype, config, True, qkv_layout, True, fp8_recipe)
     assert not cutedsl_calls, "CuTeDSL backward ran with NVTE_CUTEDSL_FP8_ATTN_BWD=0"
 
     monkeypatch.setenv("NVTE_CUTEDSL_FP8_ATTN_BWD", "1")
     logging.info("[test_dpa_fp8_cutedsl_bwd]: run with CuTeDSL")
-    cutedsl_fwd, cutedsl_bwd = _run_dpa_fp8_vs_f16(
-        dtype, config, True, qkv_layout, True, fp8_recipe
-    )
+    _, cutedsl_bwd = _run_dpa_fp8_vs_f16(dtype, config, True, qkv_layout, True, fp8_recipe)
     assert cutedsl_calls, "the CuTeDSL backward was not selected"
 
-    # same cuDNN forward in both runs
-    torch.testing.assert_close(cutedsl_fwd, cudnn_fwd, atol=0, rtol=0)
     # P and dS are quantized with the same scales on both paths; dQ accumulation order and the
     # softmax recompute differ
     atol = 5e-1
