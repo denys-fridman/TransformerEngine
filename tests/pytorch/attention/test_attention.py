@@ -31,6 +31,7 @@ from transformer_engine.pytorch import (
 )
 from transformer_engine.pytorch.attention.dot_product_attention import (
     _attention_backends,
+    cutedsl_fused_attn,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     FlashAttentionUtils,
@@ -3435,6 +3436,106 @@ def _run_dpa_fp8_vs_f16(dtype, config, fp8_dpa, qkv_layout, is_training, fp8_rec
     if is_training:
         return out, (inp[0].grad, inp[1].grad, inp[2].grad, d_softmax_offset)
     return out, (None, None, None, d_softmax_offset)
+
+
+model_configs_fp8_cutedsl_bwd = {
+    # test: ModelConfig(b, sq, hq, dqk)
+    "fp8_cutedsl_1": ModelConfig(2, 4096, 64, 64, num_gqa_groups=8, attn_mask_type="causal"),
+    "fp8_cutedsl_2": ModelConfig(
+        1, 8192, 64, 64, num_gqa_groups=8, attn_mask_type="causal", window_size=(127, 0)
+    ),
+    "fp8_cutedsl_3": ModelConfig(
+        1, 8192, 64, 64, num_gqa_groups=8, attn_mask_type="causal", softmax_type="learnable"
+    ),
+    "fp8_cutedsl_4": ModelConfig(
+        2,
+        4096,
+        64,
+        64,
+        num_gqa_groups=8,
+        attn_mask_type="causal",
+        window_size=(127, 0),
+        softmax_type="learnable",
+    ),
+}
+
+
+@pytest.mark.skipif(not fp8_attn_available, reason=reason_for_no_fp8_attn)
+@pytest.mark.skipif(
+    get_device_compute_capability()[0] != 10,
+    reason="CuTeDSL FP8 attention backward requires compute capability 10.x",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("model", model_configs_fp8_cutedsl_bwd.keys())
+@pytest.mark.parametrize("fp8_format", [recipe.Format.HYBRID, recipe.Format.E4M3])
+def test_dpa_fp8_cutedsl_bwd(dtype, model, fp8_format, monkeypatch):
+    """Test the CuTeDSL FP8 attention backward against the cuDNN FP8 backward"""
+    pytest.importorskip("cutlass")
+    config = model_configs_fp8_cutedsl_bwd[model]
+    qkv_layout = "sbhd_sbhd_sbhd"
+    fp8_recipe = recipe.Float8CurrentScaling(fp8_format=fp8_format, fp8_dpa=True)
+    available_backends, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=torch.float8_e4m3fn,
+        nominal_dtype=dtype,
+        qkv_layout=qkv_layout,
+        fp8=True,
+        fp8_meta={"recipe": fp8_recipe},
+        is_training=True,
+        deterministic=_deterministic,
+    )
+    _, fused_attn_supported_fp8, _ = available_backends
+    if not fused_attn_supported_fp8:
+        pytest.skip("FP8 FusedAttention backend not available.")
+
+    os.environ["NVTE_FLASH_ATTN"] = "0"
+    os.environ["NVTE_FUSED_ATTN"] = "1"
+    os.environ["NVTE_UNFUSED_ATTN"] = "0"
+    os.environ["NVTE_FP8_DPA_BWD"] = "1"
+    _attention_backends["backend_selection_requires_update"] = True
+
+    cutedsl_calls = []
+    cutedsl_fp8_bwd = cutedsl_fused_attn.fp8_bwd
+
+    def counted_fp8_bwd(*args, **kwargs):
+        cutedsl_calls.append(1)
+        return cutedsl_fp8_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(cutedsl_fused_attn, "fp8_bwd", counted_fp8_bwd)
+
+    monkeypatch.setenv("NVTE_CUTEDSL_FP8_ATTN_BWD", "0")
+    logging.info("[test_dpa_fp8_cutedsl_bwd]: run with cuDNN")
+    cudnn_fwd, cudnn_bwd = _run_dpa_fp8_vs_f16(dtype, config, True, qkv_layout, True, fp8_recipe)
+    assert not cutedsl_calls, "CuTeDSL backward ran with NVTE_CUTEDSL_FP8_ATTN_BWD=0"
+
+    monkeypatch.setenv("NVTE_CUTEDSL_FP8_ATTN_BWD", "1")
+    logging.info("[test_dpa_fp8_cutedsl_bwd]: run with CuTeDSL")
+    cutedsl_fwd, cutedsl_bwd = _run_dpa_fp8_vs_f16(
+        dtype, config, True, qkv_layout, True, fp8_recipe
+    )
+    assert cutedsl_calls, "the CuTeDSL backward was not selected"
+
+    # same cuDNN forward in both runs
+    torch.testing.assert_close(cutedsl_fwd, cudnn_fwd, atol=0, rtol=0)
+    # P and dS are quantized with the same scales on both paths; dQ accumulation order and the
+    # softmax recompute differ
+    atol = 5e-1
+    rtol = 5e-2
+    rmse_tol = 0.11
+    for name, cutedsl_grad, cudnn_grad in zip(
+        ["dq", "dk", "dv", "d_softmax_offset"], cutedsl_bwd, cudnn_bwd
+    ):
+        logging.debug("========== {:^25s} ==========".format(name))
+        compare_and_assert(
+            cutedsl_grad,
+            cudnn_grad,
+            f"cutedsl_{name}",
+            f"cudnn_{name}",
+            atol,
+            rtol,
+            rmse_tol,
+            True,
+        )
 
 
 model_configs_fp8 = {
