@@ -401,6 +401,60 @@ def test_grouped_linear_accuracy(
             torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", param_types, ids=str)
+@pytest.mark.parametrize("fuse_wgrad_accumulation", all_boolean)
+@pytest.mark.parametrize("bias", all_boolean)
+def test_grouped_linear_accuracy_delay_wgrad_compute_side_stream(
+    dtype, fuse_wgrad_accumulation, bias, num_gemms=3, bs=2, model="126m"
+):
+    """Delayed wgrads run on a caller-provided stream match the delayed wgrads on the current one."""
+    if NVTE_TEST_NVINSPECT_ENABLED:
+        pytest.skip("Delayed wgrad compute is not supported in debug mode.")
+
+    config = model_configs[model]
+    kwargs = dict(
+        bias=bias,
+        params_dtype=dtype,
+        device="cuda",
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        delay_wgrad_compute=True,
+        save_original_input=False,
+    )
+    grouped_linear = GroupedLinear(num_gemms, config.hidden_size, 4 * config.hidden_size, **kwargs)
+    grouped_linear_ref = GroupedLinear(
+        num_gemms, config.hidden_size, 4 * config.hidden_size, **kwargs
+    )
+    grouped_linear.eval()
+    grouped_linear_ref.eval()
+    grouped_linear.wgrad_store.set_stream(torch.cuda.Stream())
+
+    # Share params
+    with torch.no_grad():
+        for i in range(num_gemms):
+            weight_i = getattr(grouped_linear, f"weight{i}")
+            setattr(grouped_linear_ref, f"weight{i}", Parameter(weight_i.clone()))
+            if bias:
+                setattr(
+                    grouped_linear_ref,
+                    f"bias{i}",
+                    Parameter(getattr(grouped_linear, f"bias{i}").clone()),
+                )
+            if fuse_wgrad_accumulation:
+                weight_i.main_grad = torch.rand_like(weight_i, dtype=torch.float32)
+                getattr(grouped_linear_ref, f"weight{i}").main_grad = weight_i.main_grad.clone()
+
+    outputs_ref = _test_grouped_linear_accuracy(
+        grouped_linear_ref, num_gemms, bs, dtype, config, None, False, fuse_wgrad_accumulation, True
+    )
+    outputs = _test_grouped_linear_accuracy(
+        grouped_linear, num_gemms, bs, dtype, config, None, False, fuse_wgrad_accumulation, True
+    )
+
+    # Should be bit-wise match
+    for o, o_ref in zip(outputs, outputs_ref):
+        torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4)
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=str)
 @pytest.mark.parametrize("num_gemms", [1, 3])

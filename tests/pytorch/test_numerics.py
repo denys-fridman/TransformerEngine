@@ -2186,6 +2186,93 @@ def test_layernorm_mlp_accuracy_delay_wgrad_compute(
 
 
 @pytest.mark.parametrize("dtype", param_types)
+@pytest.mark.parametrize("bias", all_boolean)
+@pytest.mark.parametrize("fuse_wgrad_accumulation", all_boolean)
+def test_linear_accuracy_delay_wgrad_compute_side_stream(dtype, bias, fuse_wgrad_accumulation):
+    """Delayed wgrad run on a caller-provided stream matches the delayed wgrad on the current one."""
+    if NVTE_TEST_NVINSPECT_ENABLED:
+        pytest.skip("Delayed wgrad compute is not supported in debug mode.")
+
+    config = model_configs["small"]
+    kwargs = dict(
+        bias=bias,
+        params_dtype=dtype,
+        device="cuda",
+        delay_wgrad_compute=True,
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+    )
+    te_linear = Linear(config.hidden_size, 4 * config.hidden_size, **kwargs).eval()
+    te_linear_ref = Linear(config.hidden_size, 4 * config.hidden_size, **kwargs).eval()
+    te_linear.wgrad_store.set_stream(torch.cuda.Stream())
+
+    # Share params
+    with torch.no_grad():
+        te_linear_ref.weight = Parameter(te_linear.weight.clone())
+        if bias:
+            te_linear_ref.bias = Parameter(te_linear.bias.clone())
+        if fuse_wgrad_accumulation:
+            te_linear.weight.main_grad = torch.rand_like(te_linear.weight, dtype=torch.float32)
+            te_linear_ref.weight.main_grad = te_linear.weight.main_grad.clone()
+
+    te_outputs = _test_granular_accuracy(te_linear, 2, dtype, config, delay_wgrad_compute=True)
+    te_outputs_ref = _test_granular_accuracy(
+        te_linear_ref, 2, dtype, config, delay_wgrad_compute=True
+    )
+
+    # Should be bit-wise match
+    for o, o_ref in zip(te_outputs, te_outputs_ref):
+        torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", param_types)
+@pytest.mark.parametrize("bias", all_boolean)
+@pytest.mark.parametrize("fuse_wgrad_accumulation", all_boolean)
+def test_layernorm_mlp_accuracy_delay_wgrad_compute_side_stream(
+    dtype, bias, fuse_wgrad_accumulation
+):
+    """Delayed wgrads run on a caller-provided stream match the delayed wgrads on the current one."""
+    if NVTE_TEST_NVINSPECT_ENABLED:
+        pytest.skip("Delayed wgrad compute is not supported in debug mode.")
+
+    config = model_configs["small"]
+    kwargs = dict(
+        hidden_size=config.hidden_size,
+        ffn_hidden_size=4 * config.hidden_size,
+        eps=config.eps,
+        bias=bias,
+        params_dtype=dtype,
+        device="cuda",
+        delay_wgrad_compute=True,
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+    )
+    ln_mlp = LayerNormMLP(**kwargs).eval()
+    ln_mlp_ref = LayerNormMLP(**kwargs).eval()
+    ln_mlp.wgrad_store.set_stream(torch.cuda.Stream())
+
+    # Share params
+    with torch.no_grad():
+        ln_mlp_ref.layer_norm_weight = Parameter(ln_mlp.layer_norm_weight.clone())
+        ln_mlp_ref.layer_norm_bias = Parameter(ln_mlp.layer_norm_bias.clone())
+        ln_mlp_ref.fc1_weight = Parameter(ln_mlp.fc1_weight.clone())
+        ln_mlp_ref.fc2_weight = Parameter(ln_mlp.fc2_weight.clone())
+        if bias:
+            ln_mlp_ref.fc1_bias = Parameter(ln_mlp.fc1_bias.clone())
+            ln_mlp_ref.fc2_bias = Parameter(ln_mlp.fc2_bias.clone())
+        if fuse_wgrad_accumulation:
+            ln_mlp.fc1_weight.main_grad = torch.rand_like(ln_mlp.fc1_weight, dtype=torch.float32)
+            ln_mlp_ref.fc1_weight.main_grad = ln_mlp.fc1_weight.main_grad.clone()
+            ln_mlp.fc2_weight.main_grad = torch.rand_like(ln_mlp.fc2_weight, dtype=torch.float32)
+            ln_mlp_ref.fc2_weight.main_grad = ln_mlp.fc2_weight.main_grad.clone()
+
+    te_outputs = _test_granular_accuracy(ln_mlp, 2, dtype, config, delay_wgrad_compute=True)
+    te_outputs_ref = _test_granular_accuracy(ln_mlp_ref, 2, dtype, config, delay_wgrad_compute=True)
+
+    # Should be bit-wise match
+    for o, o_ref in zip(te_outputs, te_outputs_ref):
+        torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", param_types)
 @pytest.mark.parametrize("bs", [2])
 @pytest.mark.parametrize("model", ["small"])
 @pytest.mark.parametrize("bias", all_boolean)
