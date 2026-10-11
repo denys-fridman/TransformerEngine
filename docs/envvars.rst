@@ -418,6 +418,21 @@ LayerNorm/RMSNorm SM Margins
                  BF16 input and normalization-output datatypes. When set to ``0``, or with an
                  earlier cuDNN version, the virtual normalization output uses FP32.
 
+.. envvar:: NVTE_RMSNORM_BWD_USE_TRITON
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Run the RMSNorm backward pass of ``LayerNormLinear``, ``LayerNormMLP`` and the
+                 ``RMSNorm`` operation on a single streaming Triton kernel instead of the C++
+                 kernels where it applies: contiguous FP32, FP16 or BF16 tensors on CUDA. The
+                 kernel also adds the residual gradient of a preceding ``MakeExtraOutput``
+                 operation and, when the operation before that consumes its gradient as MXFP8
+                 (for example a ``Linear`` under the MXFP8 recipe), emits the gradient quantized
+                 with rowwise and columnwise scales so that no separate cast is needed. The
+                 weight gradient is reduced from per-block FP32 partial sums, so results match
+                 the C++ kernels within floating-point accumulation error, not bit-for-bit.
+                 :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` does not apply to the Triton kernel.
+
 .. envvar:: NVTE_FWD_LAYERNORM_SM_MARGIN
 
    :Type: ``int``
