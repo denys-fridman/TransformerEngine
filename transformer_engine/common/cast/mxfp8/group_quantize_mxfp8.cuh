@@ -928,7 +928,10 @@ __global__ void __launch_bounds__(CastTraits::THREADS_PER_CHUNK) group_quantize_
 
     int buff_in = 0;
     size_t chunk_rows = CHUNK_DIM_Y;
-    if constexpr (CHUNK_DIM_Y > TILE_DIM_Y) {
+    if constexpr (use_direct_same_both_mapper || (CHUNK_DIM_Y > TILE_DIM_Y)) {
+      // The tensors are stacked back to back: the last chunk of a tensor whose row count is not a
+      // multiple of CHUNK_DIM_Y stops at its last row instead of writing the scales of the rows
+      // that follow it (the next tensor's, or none for the last tensor).
       chunk_rows = min(static_cast<size_t>(CHUNK_DIM_Y), rows - tensor_offset_Y);
     }
     const size_t chunk_cols = min(static_cast<size_t>(CHUNK_DIM_X), cols - block_offset_X);
@@ -1184,6 +1187,17 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
     NVTE_CHECK(first_logical_dim % tile_dim_y == 0,
                "First logical dimension of a grouped tensor must be divisible by ", tile_dim_y,
                ".");
+  }
+  if (shape_rep == ShapeRepresentation::SAME_BOTH_DIMS) {
+    // Each stacked tensor must hold whole scaling blocks; the dbias workspace and the
+    // GEMM-swizzled scale layout are additionally tiled per tile_dim_y rows.
+    const size_t row_alignment = (IS_DBIAS || with_gemm_swizzled_scales)
+                                     ? tile_dim_y
+                                     : CastTraits<ShapeRepresentation::SAME_BOTH_DIMS>::SCALE_DIM_Y;
+    NVTE_CHECK(first_logical_dim % num_tensors == 0 &&
+                   (first_logical_dim / num_tensors) % row_alignment == 0,
+               "First dimension of each tensor in a uniform group must be divisible by ",
+               row_alignment, ".");
   }
 
   const int64_t *const offsets_ptr = reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);
