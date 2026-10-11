@@ -2424,36 +2424,37 @@ class GroupedLinear(TransformerEngineBaseModule):
         if self.wgrad_store.context is None or self.wgrad_store.context.empty():
             return
         with get_nvtx_range_context("_GroupedLinear_wgrad"):
-            (_, grad_biases_, _), tensor_list = self.wgrad_store.pop()
-            wgrad_output = tensor_list[2]
-            weight_params = self._get_weight_tensors()
-            if not self.fuse_wgrad_accumulation:
-                if self.single_grouped_weight:
-                    weight_params[0].grad = wgrad_output.rowwise_data.view(
-                        self.num_gemms, self.out_features, self.in_features
-                    ).to(weight_params[0].dtype)
-                else:
+            with self.wgrad_store.stream_context():
+                (_, grad_biases_, _), tensor_list = self.wgrad_store.pop()
+                wgrad_output = tensor_list[2]
+                weight_params = self._get_weight_tensors()
+                if not self.fuse_wgrad_accumulation:
+                    if self.single_grouped_weight:
+                        weight_params[0].grad = wgrad_output.rowwise_data.view(
+                            self.num_gemms, self.out_features, self.in_features
+                        ).to(weight_params[0].dtype)
+                    else:
+                        for i in range(self.num_gemms):
+                            weight_params[i].grad = wgrad_output[i].to(weight_params[i].dtype)
+                has_grad_biases = [
+                    grad_bias is not None and grad_bias.numel() != 0 for grad_bias in grad_biases_
+                ]
+                if self.use_bias and any(has_grad_biases):
+                    if self.use_grouped_tensor:
+                        raise RuntimeError(
+                            "GroupedLinear(use_grouped_tensor=True) fell back to the split-quantize"
+                            " path, which produced per-expert bias gradients during delayed wgrad."
+                            " This implicit fallback is unsupported with delay_wgrad_compute=True."
+                            " Use a configuration supported by the grouped-tensor path, or set"
+                            " use_grouped_tensor=False to select the legacy path explicitly."
+                        )
+                    bias_params = [getattr(self, f"bias{i}") for i in range(self.num_gemms)]
                     for i in range(self.num_gemms):
-                        weight_params[i].grad = wgrad_output[i].to(weight_params[i].dtype)
-            has_grad_biases = [
-                grad_bias is not None and grad_bias.numel() != 0 for grad_bias in grad_biases_
-            ]
-            if self.use_bias and any(has_grad_biases):
-                if self.use_grouped_tensor:
-                    raise RuntimeError(
-                        "GroupedLinear(use_grouped_tensor=True) fell back to the split-quantize "
-                        "path, which produced per-expert bias gradients during delayed wgrad. "
-                        "This implicit fallback is unsupported with delay_wgrad_compute=True. "
-                        "Use a configuration supported by the grouped-tensor path, or set "
-                        "use_grouped_tensor=False to select the legacy path explicitly."
-                    )
-                bias_params = [getattr(self, f"bias{i}") for i in range(self.num_gemms)]
-                for i in range(self.num_gemms):
-                    if has_grad_biases[i] and bias_params[i].grad is None:
-                        bias_params[i].grad = grad_biases_[i].to(bias_params[i].dtype)
-            del grad_biases_
-            del wgrad_output
-            del tensor_list
+                        if has_grad_biases[i] and bias_params[i].grad is None:
+                            bias_params[i].grad = grad_biases_[i].to(bias_params[i].dtype)
+                del grad_biases_
+                del wgrad_output
+                del tensor_list
             self._trigger_wgrad_accumulation_and_reduce_hooks()
 
     def _customize_quantizers_float8_current_scaling(self, fwd: bool, recipe: Recipe) -> None:

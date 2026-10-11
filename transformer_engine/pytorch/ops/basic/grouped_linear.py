@@ -345,35 +345,35 @@ class GroupedLinear(BasicOperation):
             return
         if self.wgrad_store.context is None or self.wgrad_store.context.empty():
             return
-        _, tensor_list = self.wgrad_store.pop()
-        activations = tensor_list[0]
-        grad_weights = tensor_list[2]
-        if isinstance(activations, list):
-            clear_tensor_data(*activations)
-        else:
-            # Fused MXFP8 grouped MLP saves `GroupedTensor` activations for wgrad.
-            clear_tensor_data(
-                activations.rowwise_data,
-                activations.columnwise_data,
-                activations.scale_inv,
-                activations.columnwise_scale_inv,
-            )
-        if self._accumulate_into_main_grad:
-            self._trigger_wgrad_accumulation_and_reduce_hooks()
-            return
-        if self.single_grouped_weight:
-            if isinstance(grad_weights, list):
-                self.weight.grad = torch.stack(grad_weights, dim=0).to(self.weight.dtype)
+        # The gradients are produced on the store's stream; the hooks run on the caller's.
+        with self.wgrad_store.stream_context():
+            _, tensor_list = self.wgrad_store.pop()
+            activations = tensor_list[0]
+            grad_weights = tensor_list[2]
+            if isinstance(activations, list):
+                clear_tensor_data(*activations)
             else:
-                self.weight.grad = grad_weights.rowwise_data.view(
-                    self.num_groups,
-                    self.out_features,
-                    self.in_features,
-                ).to(self.weight.dtype)
-        else:
-            for group_idx in range(self.num_groups):
-                w = getattr(self, f"weight{group_idx}")
-                w.grad = grad_weights[group_idx].to(w.dtype)
+                # Fused MXFP8 grouped MLP saves `GroupedTensor` activations for wgrad.
+                clear_tensor_data(
+                    activations.rowwise_data,
+                    activations.columnwise_data,
+                    activations.scale_inv,
+                    activations.columnwise_scale_inv,
+                )
+            if not self._accumulate_into_main_grad:
+                if self.single_grouped_weight:
+                    if isinstance(grad_weights, list):
+                        self.weight.grad = torch.stack(grad_weights, dim=0).to(self.weight.dtype)
+                    else:
+                        self.weight.grad = grad_weights.rowwise_data.view(
+                            self.num_groups,
+                            self.out_features,
+                            self.in_features,
+                        ).to(self.weight.dtype)
+                else:
+                    for group_idx in range(self.num_groups):
+                        w = getattr(self, f"weight{group_idx}")
+                        w.grad = grad_weights[group_idx].to(w.dtype)
         self._trigger_wgrad_accumulation_and_reduce_hooks()
 
     def _get_discrete_bias_tensors(self, dtype: torch.dtype) -> list[torch.Tensor]:

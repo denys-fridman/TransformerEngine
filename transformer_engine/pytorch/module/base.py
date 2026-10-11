@@ -2002,16 +2002,18 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         if not self.need_backward_dw():
             return
         with get_nvtx_range_context(f"_{self.__class__.__name__}_wgrad"):
-            (wgrad, bgrad), _ = self.wgrad_store.pop()
-            if not self.fuse_wgrad_accumulation:
-                weight_tensor = noop_cat(self._get_weight_tensors())
-                weight_tensor.grad = wgrad.to(weight_tensor.dtype)
-            if self.use_bias and bgrad is not None and bgrad.numel() != 0:
-                bias_tensor = noop_cat([getattr(self, name) for name in self.bias_names])
-                if bias_tensor.grad is None:
-                    bias_tensor.grad = bgrad.to(bias_tensor.dtype)
-            del wgrad
-            del bgrad
+            # The gradients are produced on the store's stream; the hooks run on the caller's.
+            with self.wgrad_store.stream_context():
+                (wgrad, bgrad), _ = self.wgrad_store.pop()
+                if not self.fuse_wgrad_accumulation:
+                    weight_tensor = noop_cat(self._get_weight_tensors())
+                    weight_tensor.grad = wgrad.to(weight_tensor.dtype)
+                if self.use_bias and bgrad is not None and bgrad.numel() != 0:
+                    bias_tensor = noop_cat([getattr(self, name) for name in self.bias_names])
+                    if bias_tensor.grad is None:
+                        bias_tensor.grad = bgrad.to(bias_tensor.dtype)
+                del wgrad
+                del bgrad
             self._trigger_wgrad_accumulation_and_reduce_hooks()
 
     def _trigger_wgrad_accumulation_and_reduce_hooks(self):

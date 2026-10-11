@@ -4,6 +4,7 @@
 
 """Internal function used by multiple modules."""
 
+import contextlib
 import dataclasses
 import queue
 from typing import Any, Callable, List, Optional, Tuple, Union
@@ -255,6 +256,17 @@ class _ParameterInitMeta:
             self.init_fn = get_default_init_method()
 
 
+def _record_stream(tensors: Any, stream: torch.cuda.Stream) -> None:
+    """Mark the tensors (nested in lists, quantized or grouped) as used by ``stream``."""
+    if isinstance(tensors, (list, tuple)):
+        for tensor in tensors:
+            _record_stream(tensor, stream)
+    elif hasattr(tensors, "get_data_tensors"):
+        _record_stream(tensors.get_data_tensors(), stream)
+    elif isinstance(tensors, torch.Tensor):
+        tensors.record_stream(stream)
+
+
 class WeightGradStore:
     """
     A class to manage weight gradient storage and computation in Transformer modules.
@@ -278,6 +290,27 @@ class WeightGradStore:
         else:
             self.context = None
             self.enabled = False
+        self.stream: Optional[torch.cuda.Stream] = None
+
+    def set_stream(self, stream: Optional[torch.cuda.Stream]) -> None:
+        """
+        Run the delayed weight gradient computations on ``stream`` instead of the
+        current stream.
+
+        ``pop`` then launches the stored computation on ``stream`` once the work the
+        current stream had enqueued at ``put`` (the producers of the stored tensors)
+        has completed, with a cuBLAS workspace of its own, and marks the stored tensors
+        as used by ``stream`` so that releasing them afterwards is safe. The caller owns
+        ``stream`` and synchronizes with it before consuming the gradients. ``None``
+        restores the default.
+        """
+        self.stream = stream
+
+    def stream_context(self):
+        """Context manager making the stream of the delayed computations current."""
+        if self.stream is None:
+            return contextlib.nullcontext()
+        return torch.cuda.stream(self.stream)
 
     def delay_wgrad_compute(self):
         """
@@ -305,7 +338,10 @@ class WeightGradStore:
             func (callable): Function to be executed with the tensors
         """
         assert self.enabled is True, "delay_wgrad_compute is not enabled"
-        self.context.put([tensor_list, func])
+        # With a stream of its own, the computation is ordered after the producers of the
+        # tensors, which the current stream has enqueued by now.
+        ready = torch.cuda.current_stream().record_event() if self.stream is not None else None
+        self.context.put([tensor_list, func, ready])
 
     def pop(self):
         """
@@ -314,8 +350,15 @@ class WeightGradStore:
         """
         assert self.enabled is True, "delay_wgrad_compute is not enabled"
         if self.context.qsize() > 0:
-            tensor_list, func = self.context.get()
-            return func(*tensor_list), tensor_list
+            tensor_list, func, ready = self.context.get()
+            if self.stream is None:
+                return func(*tensor_list), tensor_list
+            self.stream.wait_event(ready)
+            with torch.cuda.stream(self.stream), tex.cublas_workspace(
+                tex.get_cublas_workspace(self.stream.device.index, False, False, self.stream)
+            ):
+                _record_stream(tensor_list, self.stream)
+                return func(*tensor_list), tensor_list
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             raise RuntimeError(f"Pop empty queue. rank {rank}")

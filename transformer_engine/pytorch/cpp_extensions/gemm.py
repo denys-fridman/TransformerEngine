@@ -5,6 +5,7 @@
 """Python interface for GEMM extensions"""
 
 from typing import Iterable, Literal, Optional, Tuple, Union, List
+import contextlib
 import os
 import functools
 import torch
@@ -32,6 +33,7 @@ __all__ = [
     "general_grouped_gemm",
     "general_grouped_gemm_for_grouped_tensor",
     "get_cublas_workspace",
+    "cublas_workspace",
 ]
 
 
@@ -47,9 +49,16 @@ def get_cublas_workspace_size_bytes() -> None:
 
 
 @functools.lru_cache(maxsize=None)
-def get_cublas_workspace(device: int, ub: bool, grouped_gemm: bool) -> torch.Tensor:
-    """Returns workspace for cublas GEMM."""
+def get_cublas_workspace(
+    device: int, ub: bool, grouped_gemm: bool, stream: Optional[torch.cuda.Stream] = None
+) -> torch.Tensor:
+    """Returns workspace for cublas GEMM.
+
+    ``stream`` selects a separate workspace for GEMMs that run on that stream
+    concurrently with the GEMMs of the current stream.
+    """
     assert not (ub and grouped_gemm), "UB is unsupported for grouped GEMM."
+    del stream  # only part of the cache key
 
     if ub:
         return torch.empty(
@@ -66,6 +75,25 @@ def get_cublas_workspace(device: int, ub: bool, grouped_gemm: bool) -> torch.Ten
         return _multi_stream_cublas_workspace
 
     return torch.empty(get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device)
+
+
+_cublas_workspace_override: Optional[torch.Tensor] = None
+
+
+@contextlib.contextmanager
+def cublas_workspace(workspace: torch.Tensor):
+    """Use ``workspace`` for the non-UB GEMMs issued in this context.
+
+    Needed when the GEMMs run on a stream of their own, concurrently with the GEMMs of
+    the current stream sharing the default workspace.
+    """
+    global _cublas_workspace_override
+    previous = _cublas_workspace_override
+    _cublas_workspace_override = workspace
+    try:
+        yield
+    finally:
+        _cublas_workspace_override = previous
 
 
 def validate_gemm_scale(scale: Optional[float], required: bool) -> float:
@@ -225,7 +253,10 @@ def general_gemm(
 
     alpha = validate_gemm_scale(alpha, True)
     beta = validate_gemm_scale(beta, accumulate)
-    workspace = get_cublas_workspace(A.device.index, ub is not None, False)
+    if _cublas_workspace_override is not None and ub is None:
+        workspace = _cublas_workspace_override
+    else:
+        workspace = get_cublas_workspace(A.device.index, ub is not None, False)
 
     if ub_type is not None:
         assert ub is not None, (

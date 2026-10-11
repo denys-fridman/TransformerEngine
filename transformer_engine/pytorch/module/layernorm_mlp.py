@@ -3147,31 +3147,32 @@ class LayerNormMLP(TransformerEngineBaseModule):
         if not self.need_backward_dw():
             return
         with get_nvtx_range_context("_LayerNormMLP_wgrad"):
-            (fc2_wgrad, fc2_bias_grad_, *_), tensor_list_fc2 = self.wgrad_store.pop()
-            if self.use_bias and self.fc1_bias.grad is None:
-                (fc1_wgrad, fc1_bias_grad, *_), _ = self.wgrad_store.pop()
-            else:
-                (fc1_wgrad, *_), _ = self.wgrad_store.pop()
-                fc1_bias_grad = None
-            if self.use_bias:
-                if self.fc2_bias.grad is None:
-                    if (
-                        self.fp8
-                        and FP8GlobalStateManager.get_fp8_recipe().float8_block_scaling()
-                        and self.apply_bias
-                        and not self.gemm_bias_unfused_add
-                    ):
-                        act_out = tensor_list_fc2[0]
-                        # BGRAD not fused with GEMM for float8 blockwise gemm.
-                        fc2_bias_grad_ = sum_bias_grad(act_out)
-                    self.fc2_bias.grad = fc2_bias_grad_.to(self.fc2_bias.dtype)
-                if self.fc1_bias.grad is None:
-                    self.fc1_bias.grad = fc1_bias_grad.to(self.fc1_bias.dtype)
-            if not self.fuse_wgrad_accumulation:
-                self.fc2_weight.grad = fc2_wgrad.to(self.fc2_weight.dtype)
-                self.fc1_weight.grad = fc1_wgrad.to(self.fc1_weight.dtype)
-            del fc2_bias_grad_
-            del fc2_wgrad
-            del fc1_wgrad
-            del fc1_bias_grad
+            with self.wgrad_store.stream_context():
+                (fc2_wgrad, fc2_bias_grad_, *_), tensor_list_fc2 = self.wgrad_store.pop()
+                if self.use_bias and self.fc1_bias.grad is None:
+                    (fc1_wgrad, fc1_bias_grad, *_), _ = self.wgrad_store.pop()
+                else:
+                    (fc1_wgrad, *_), _ = self.wgrad_store.pop()
+                    fc1_bias_grad = None
+                if self.use_bias:
+                    if self.fc2_bias.grad is None:
+                        if (
+                            self.fp8
+                            and FP8GlobalStateManager.get_fp8_recipe().float8_block_scaling()
+                            and self.apply_bias
+                            and not self.gemm_bias_unfused_add
+                        ):
+                            act_out = tensor_list_fc2[0]
+                            # BGRAD not fused with GEMM for float8 blockwise gemm.
+                            fc2_bias_grad_ = sum_bias_grad(act_out)
+                        self.fc2_bias.grad = fc2_bias_grad_.to(self.fc2_bias.dtype)
+                    if self.fc1_bias.grad is None:
+                        self.fc1_bias.grad = fc1_bias_grad.to(self.fc1_bias.dtype)
+                if not self.fuse_wgrad_accumulation:
+                    self.fc2_weight.grad = fc2_wgrad.to(self.fc2_weight.dtype)
+                    self.fc1_weight.grad = fc1_wgrad.to(self.fc1_weight.dtype)
+                del fc2_bias_grad_
+                del fc2_wgrad
+                del fc1_wgrad
+                del fc1_bias_grad
             self._trigger_wgrad_accumulation_and_reduce_hooks()
