@@ -279,6 +279,17 @@ FP8 Configuration
    :Default: ``1``
    :Description: For Float8CurrentScaling in DotProductAttention, use FP16/BF16 for the output tensor in the backward pass. ``1`` = use F16/BF16 output in backward, ``0`` = use FP8 output in backward.
 
+.. envvar:: NVTE_CUTEDSL_FP8_ATTN_BWD
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Run the FP8 backward pass of DotProductAttention on the CuTeDSL fused kernel instead of cuDNN where it applies:
+                 Float8CurrentScaling with the output in FP16/BF16 (:envvar:`NVTE_DPA_FP8CS_O_in_F16`), ``sbhd`` Q/K/V of equal
+                 length with head dimension 64, a causal or causal + sliding-window mask, no bias or dropout, a vanilla or
+                 learnable softmax, non-deterministic mode, on compute capability 10.x. Every other call stays on cuDNN.
+                 Requires ``nvidia-cutlass-dsl``. The kernel accumulates dQ with atomics and recomputes the softmax on the
+                 special function unit, so its gradients match cuDNN within FP8 tolerances, not bit-for-bit.
+
 .. envvar:: NVTE_DPA_FP8_RECIPE
 
    :Type: ``str``

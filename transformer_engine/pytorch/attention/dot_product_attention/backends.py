@@ -78,6 +78,7 @@ from transformer_engine.pytorch.cpu_offload_v1 import is_current_layer_offloaded
 
 # Import attention utils
 import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
+import transformer_engine.pytorch.attention.dot_product_attention.cutedsl_fused_attn as cutedsl_fused_attn
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     FlashAttentionUtils as fa_utils,
     combine_and_quantize,
@@ -2165,41 +2166,47 @@ def _fused_attn_backward_impl(
                 if args.qkv_type == "mxfp8":
                     out_ = out
                     aux_ctx_tensors.append(d_out)
-                dq_, dk_, dv_, *rest = fused_attn_bwd(
-                    args.max_seqlen_q,
-                    args.max_seqlen_kv,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    q_fp8,
-                    k_fp8,
-                    v_fp8,
-                    out_,
-                    d_out_fp8,
-                    dqkv_nominal_dtype,
-                    aux_ctx_tensors,
-                    args.fused_attention_backend,
-                    cu_seqlens_q_padded,
-                    cu_seqlens_kv_padded,
-                    args.S_quantizer,
-                    args.dP_quantizer,
-                    args.dQKV_quantizer,
-                    args.attn_scale,
-                    args.dropout_p,
-                    args.fast_zero_fill,
-                    args.qkv_layout,
-                    args.o_format,
-                    do_format,
-                    args.dqkv_layout,
-                    args.qkv_scale_inv_format,
-                    do_scale_inv_format,
-                    args.attn_bias_type,
-                    args.attn_mask_type,
-                    args.softmax_type,
-                    args.window_size,
-                    args.bottom_right_diagonal,
-                    args.deterministic,
-                    is_graph_capturing(),
-                )
+                if cutedsl_fused_attn.fp8_bwd_supported(args, out_, d_out_fp8):
+                    dq_, dk_, dv_, d_softmax_offset_ = cutedsl_fused_attn.fp8_bwd(
+                        args, out_, d_out_fp8, aux_ctx_tensors[0]
+                    )
+                    rest = [None, d_softmax_offset_]
+                else:
+                    dq_, dk_, dv_, *rest = fused_attn_bwd(
+                        args.max_seqlen_q,
+                        args.max_seqlen_kv,
+                        cu_seqlens_q,
+                        cu_seqlens_kv,
+                        q_fp8,
+                        k_fp8,
+                        v_fp8,
+                        out_,
+                        d_out_fp8,
+                        dqkv_nominal_dtype,
+                        aux_ctx_tensors,
+                        args.fused_attention_backend,
+                        cu_seqlens_q_padded,
+                        cu_seqlens_kv_padded,
+                        args.S_quantizer,
+                        args.dP_quantizer,
+                        args.dQKV_quantizer,
+                        args.attn_scale,
+                        args.dropout_p,
+                        args.fast_zero_fill,
+                        args.qkv_layout,
+                        args.o_format,
+                        do_format,
+                        args.dqkv_layout,
+                        args.qkv_scale_inv_format,
+                        do_scale_inv_format,
+                        args.attn_bias_type,
+                        args.attn_mask_type,
+                        args.softmax_type,
+                        args.window_size,
+                        args.bottom_right_diagonal,
+                        args.deterministic,
+                        is_graph_capturing(),
+                    )
                 # dq, dk, dv:             torch.Tensor; dtype = torch.float16 or torch.bfloat16
                 dq, dk, dv = dq_, dk_, dv_
                 is_quantized_tensor = isinstance(dq_, QuantizedTensorStorage)
