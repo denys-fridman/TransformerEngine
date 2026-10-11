@@ -18,6 +18,7 @@ from transformer_engine.pytorch.ops.op import (
     FusibleOperation,
     OperationContext,
 )
+from ...triton import rmsnorm_bwd as triton_rmsnorm_bwd
 from ...utils import clear_tensor_data
 from .._common import maybe_dequantize
 
@@ -58,27 +59,40 @@ class BackwardAddRMSNorm(FusedOperation):
         w = maybe_dequantize(rmsnorm_op.weight, dtype).view((inner_dim,))
         if extra_grad is None:
             # Extra output is not consumed, so its gradient is zero
-            add = torch.zeros_like(dy)
+            add = None
         else:
             add = maybe_dequantize(extra_grad.contiguous(), dtype).view(x.size())
 
         # Compute RMSNorm backward pass
-        dx, dw = tex.rmsnorm_bwd_add(
-            dy,
-            x,
-            add,
-            rstdevs,
-            w,
-            rmsnorm_op._sm_margins["backward"],
-            rmsnorm_op.zero_centered_gamma,
-        )
+        quantizer = basic_op_ctxs[0].grad_input_quantizer
+        if triton_rmsnorm_bwd.is_supported(dy, x, rstdevs, w, add=add, quantizer=quantizer):
+            grad_input, dw = triton_rmsnorm_bwd.rmsnorm_bwd(
+                dy,
+                x,
+                rstdevs,
+                w,
+                zero_centered_gamma=rmsnorm_op.zero_centered_gamma,
+                add=add,
+                quantizer=quantizer,
+                out_shape=grad_output.size(),
+            )
+        else:
+            dx, dw = tex.rmsnorm_bwd_add(
+                dy,
+                x,
+                torch.zeros_like(dy) if add is None else add,
+                rstdevs,
+                w,
+                rmsnorm_op._sm_margins["backward"],
+                rmsnorm_op.zero_centered_gamma,
+            )
+            grad_input = dx.view(grad_output.size())
 
         # Clear saved tensors if possible
         clear_tensor_data(x)
         clear_tensor_data(rstdevs)
 
         # Reshape results
-        grad_input = dx.view(grad_output.size())
         grad_weight = dw.view(weight_dims)
 
         return grad_input, [(), (grad_weight,)], [(), ()]

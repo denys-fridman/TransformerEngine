@@ -49,6 +49,22 @@ def get_fused_normalization_quantizer(
     return None
 
 
+def get_grad_input_quantizer(
+    prev_op_grad_output_quantizer: Optional[Quantizer],
+) -> Optional[Quantizer]:
+    """Quantizer for a grad input that the preceding operation's backward consumes quantized.
+
+    Evaluated in the forward pass, where the autocast state tells
+    whether that backward runs with quantized compute.
+
+    """
+    if prev_op_grad_output_quantizer is None or not FP8GlobalStateManager.is_fp8_enabled():
+        return None
+    if FP8GlobalStateManager.get_fp8_recipe().backward_override is not None:
+        return None
+    return prev_op_grad_output_quantizer
+
+
 def validate_buffer(
     name: str,
     buffer: Optional[torch.Tensor],

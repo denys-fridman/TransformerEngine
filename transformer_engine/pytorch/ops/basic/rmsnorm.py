@@ -17,6 +17,7 @@ from ...constants import TE_DType
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
 from ...export import is_in_onnx_export_mode
 from ...tensor import Quantizer
+from ...triton import rmsnorm_bwd as triton_rmsnorm_bwd
 from ...utils import (
     canonicalize_device,
     canonicalize_dtype,
@@ -26,6 +27,7 @@ from ...utils import (
 from ..op import BasicOperation, OperationContext
 from .._common import (
     get_fused_normalization_quantizer,
+    get_grad_input_quantizer,
     maybe_autocast_dtype,
     maybe_dequantize,
 )
@@ -208,6 +210,7 @@ class RMSNorm(BasicOperation):
                 mark_activation_offload(x, rstdevs)
             ctx.save_for_backward(x, rstdevs)
             ctx.dtype = dtype
+            ctx.grad_input_quantizer = get_grad_input_quantizer(prev_op_grad_output_quantizer)
 
         # Reshape output tensor
         out = y.view(input_dims)
@@ -232,21 +235,33 @@ class RMSNorm(BasicOperation):
         w = maybe_dequantize(self.weight, dtype).view((inner_dim,))
 
         # Compute RMSNorm backward pass
-        dx, dw = rmsnorm_bwd(
-            dy,
-            x,
-            rstdevs,
-            w,
-            self._sm_margins["backward"],
-            self.zero_centered_gamma,
-        )
+        quantizer = ctx.grad_input_quantizer
+        if triton_rmsnorm_bwd.is_supported(dy, x, rstdevs, w, quantizer=quantizer):
+            grad_input, dw = triton_rmsnorm_bwd.rmsnorm_bwd(
+                dy,
+                x,
+                rstdevs,
+                w,
+                zero_centered_gamma=self.zero_centered_gamma,
+                quantizer=quantizer,
+                out_shape=grad_output.size(),
+            )
+        else:
+            dx, dw = rmsnorm_bwd(
+                dy,
+                x,
+                rstdevs,
+                w,
+                self._sm_margins["backward"],
+                self.zero_centered_gamma,
+            )
+            grad_input = dx.view(grad_output.size())
 
         # Clear saved tensors if possible
         clear_tensor_data(x)
         clear_tensor_data(rstdevs)
 
         # Reshape results
-        grad_input = dx.view(grad_output.size())
         grad_weight = dw.view(weight_dims)
         return grad_input, (grad_weight,)
 

@@ -15,6 +15,7 @@ from transformer_engine.pytorch.ops.op import (
     OperationContext,
 )
 from ...tensor import Quantizer
+from .._common import get_grad_input_quantizer
 
 
 class MakeExtraOutput(BasicOperation):
@@ -73,6 +74,10 @@ class MakeExtraOutput(BasicOperation):
         next_op_input_quantizer: Optional[Quantizer],
         basic_op_kwargs: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, Sequence[Sequence[torch.Tensor]]]:
+        # For a fused backward that emits the grad input in the preceding op's format
+        basic_op_ctxs[0].grad_input_quantizer = get_grad_input_quantizer(
+            prev_op_grad_output_quantizer
+        )
         return input_, [(input_,)]
 
     def fuser_backward(

@@ -62,6 +62,7 @@ from ..distributed_weight import (
 from ..constants import FP8BwdTensorIdx, FP8FwdTensorIdx, GemmParallelModes, dist_group_type
 from ..jit import no_torch_dynamo
 from ..graph import is_graph_capturing
+from ..triton import rmsnorm_bwd as triton_rmsnorm_bwd
 from ._common import (
     apply_normalization,
     check_fp8_reduce_and_update,
@@ -1410,14 +1411,23 @@ def _layernorm_linear_backward_impl(
                 args.zero_centered_gamma,
             )
         elif args.normalization == "RMSNorm":
-            dgrad, dgamma = tex.rmsnorm_bwd(
-                dgrad,
-                inputmat,
-                rsigma,
-                ln_weight,
-                args.bwd_ln_sm_margin,
-                args.zero_centered_gamma,
-            )
+            if triton_rmsnorm_bwd.is_supported(dgrad, inputmat, rsigma, ln_weight):
+                dgrad, dgamma = triton_rmsnorm_bwd.rmsnorm_bwd(
+                    dgrad,
+                    inputmat,
+                    rsigma,
+                    ln_weight,
+                    zero_centered_gamma=args.zero_centered_gamma,
+                )
+            else:
+                dgrad, dgamma = tex.rmsnorm_bwd(
+                    dgrad,
+                    inputmat,
+                    rsigma,
+                    ln_weight,
+                    args.bwd_ln_sm_margin,
+                    args.zero_centered_gamma,
+                )
             dbeta = None
         nvtx_range_pop(f"{nvtx_label}.norm")
         clear_tensor_data(mu)

@@ -63,6 +63,7 @@ from ..distributed import (
 from ..constants import FP8BwdTensorIdx, FP8FwdTensorIdx, dist_group_type
 from ..jit import no_torch_dynamo
 from ..graph import is_graph_capturing
+from ..triton import rmsnorm_bwd as triton_rmsnorm_bwd
 from ..tensor.float8_tensor import Float8Tensor
 from ..tensor.mxfp8_tensor import MXFP8Quantizer
 from ..tensor.nvfp4_tensor import NVFP4Quantizer
@@ -1986,14 +1987,23 @@ def _layernorm_mlp_backward_impl(
                 args.zero_centered_gamma,
             )
         elif args.normalization == "RMSNorm":
-            dgrad, dgamma = tex.rmsnorm_bwd(
-                dgrad,
-                inputmat,
-                rsigma,
-                ln_weight,
-                args.bwd_ln_sm_margin,
-                args.zero_centered_gamma,
-            )
+            if triton_rmsnorm_bwd.is_supported(dgrad, inputmat, rsigma, ln_weight):
+                dgrad, dgamma = triton_rmsnorm_bwd.rmsnorm_bwd(
+                    dgrad,
+                    inputmat,
+                    rsigma,
+                    ln_weight,
+                    zero_centered_gamma=args.zero_centered_gamma,
+                )
+            else:
+                dgrad, dgamma = tex.rmsnorm_bwd(
+                    dgrad,
+                    inputmat,
+                    rsigma,
+                    ln_weight,
+                    args.bwd_ln_sm_margin,
+                    args.zero_centered_gamma,
+                )
             dbeta = None
     clear_tensor_data(mu, rsigma)
 
