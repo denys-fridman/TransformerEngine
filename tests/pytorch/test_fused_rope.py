@@ -10,6 +10,16 @@ from transformer_engine.pytorch.attention.rope import (
     apply_rotary_pos_emb,
     apply_fused_qkv_rotary_pos_emb,
 )
+from transformer_engine.pytorch.attention.fused_qkv_rope_quantize import (
+    fused_qkv_rope_quantize_supported,
+)
+from transformer_engine.pytorch.tensor.float8_tensor import (
+    Float8CurrentScalingQuantizer,
+    Float8Tensor,
+)
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+from transformer_engine.pytorch.utils import get_device_compute_capability
+import transformer_engine_torch as tex
 
 
 # Gradient is a broadcasted scalar
@@ -497,3 +507,105 @@ def test_rotary_position_embedding_forward_with_autocast_gives_same_result_as_wi
         atol=1e-8,
         rtol=1e-8,
     )
+
+
+@pytest.mark.skipif(
+    get_device_compute_capability()[0] != 10,
+    reason="The fused QKV RoPE + quantize kernel requires compute capability 10.x",
+)
+@pytest.mark.parametrize("seq_length", [128, 2048])
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("num_groups, q_heads_per_group", [(8, 8), (4, 4)])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("swizzled_scales", [True, False])
+def test_fused_qkv_rope_quantize(
+    seq_length: int,
+    batch_size: int,
+    num_groups: int,
+    q_heads_per_group: int,
+    with_bias: bool,
+    swizzled_scales: bool,
+) -> None:
+    """The fused RoPE + quantize path against the fused RoPE followed by TE's quantizers."""
+    pytest.importorskip("cutlass")
+    device = torch.device("cuda:0")
+    head_dim = 64
+    hidden = num_groups * (q_heads_per_group + 2) * head_dim
+    split = [q_heads_per_group * head_dim, head_dim, head_dim]
+    emb = RotaryPositionEmbedding(head_dim)(seq_length)
+    qkv = torch.randn(
+        (seq_length, batch_size, hidden), dtype=torch.bfloat16, device=device, requires_grad=True
+    )
+    bias = (
+        torch.randn(hidden, dtype=torch.bfloat16, device=device, requires_grad=True)
+        if with_bias
+        else None
+    )
+    grads = [
+        torch.randn((seq_length, batch_size, heads, head_dim), dtype=torch.bfloat16, device=device)
+        for heads in (num_groups * q_heads_per_group, num_groups, num_groups)
+    ]
+    qkv_quantizer = Float8CurrentScalingQuantizer(tex.DType.kFloat8E4M3, device)
+    grad_qkv_quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+    grad_qkv_quantizer.optimize_for_gemm = swizzled_scales
+    assert fused_qkv_rope_quantize_supported(
+        qkv, emb, emb, split, qkv_quantizer, grad_qkv_quantizer, bias
+    )
+    assert not fused_qkv_rope_quantize_supported(
+        qkv, emb, emb, split, qkv_quantizer, grad_qkv_quantizer, bias, interleaved=True
+    )
+
+    # reference: the fused RoPE of the biased input and TE's quantizers on its outputs
+    qkv_ref = qkv.detach().clone().requires_grad_()
+    biased = qkv_ref if bias is None else qkv_ref + bias.detach()
+    q_ref, k_ref, v_ref = apply_fused_qkv_rotary_pos_emb(
+        biased.view(seq_length, batch_size, num_groups, -1), emb, emb, split
+    )
+    torch.autograd.backward([q_ref, k_ref, v_ref], grads)
+    qkv_fp8_ref = qkv_quantizer.copy()(
+        torch.cat([t.detach().reshape(-1) for t in (q_ref, k_ref, v_ref)])
+    )
+    grad_fp8_ref = grad_qkv_quantizer.copy()(qkv_ref.grad.view(seq_length * batch_size, hidden))
+
+    q, k, v = apply_fused_qkv_rotary_pos_emb(
+        qkv,
+        emb,
+        emb,
+        split,
+        bias=bias,
+        qkv_quantizer=qkv_quantizer,
+        grad_qkv_quantizer=grad_qkv_quantizer,
+    )
+    torch.autograd.backward([q, k, v], grads)
+
+    offset = 0
+    for fused, ref in zip((q, k, v), (q_ref, k_ref, v_ref)):
+        assert isinstance(fused, Float8Tensor) and fused.shape == ref.shape
+        assert fused._scale_inv.data_ptr() == q._scale_inv.data_ptr()
+        ref_fp8 = Float8Tensor.make_like(
+            qkv_fp8_ref, data=qkv_fp8_ref._data[offset : offset + ref.numel()].view(ref.shape)
+        )
+        offset += ref.numel()
+        # the fused kernel adds the bias in fp32 where the reference rounds qkv + bias to bf16
+        # first, so values may land one FP8 step apart
+        torch.testing.assert_close(
+            fused.dequantize(), ref_fp8.dequantize(), rtol=2**-3, atol=float(q._scale_inv)
+        )
+    torch.testing.assert_close(q._scale_inv, qkv_fp8_ref._scale_inv, rtol=2**-7, atol=0)
+
+    grad = qkv.grad
+    assert isinstance(grad, MXFP8Tensor) and grad.shape == qkv.shape
+    assert grad._with_gemm_swizzled_scales == swizzled_scales
+    for name in (
+        "_rowwise_data",
+        "_rowwise_scale_inv",
+        "_columnwise_data",
+        "_columnwise_scale_inv",
+    ):
+        torch.testing.assert_close(
+            getattr(grad, name).reshape(-1), getattr(grad_fp8_ref, name).reshape(-1), rtol=0, atol=0
+        )
+    if with_bias:
+        torch.testing.assert_close(
+            bias.grad.float(), qkv_ref.grad.float().sum(dim=(0, 1)), rtol=1e-2, atol=1e-2
+        )
