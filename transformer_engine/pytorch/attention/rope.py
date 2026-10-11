@@ -9,7 +9,12 @@ from typing import Optional, Tuple, Union, List
 import torch
 
 import transformer_engine_torch as tex
+from transformer_engine.pytorch.attention.fused_qkv_rope_quantize import (
+    FusedQKVRoPEQuantizeFunc,
+    fused_qkv_rope_quantize_supported,
+)
 from transformer_engine.pytorch.cpp_extensions.fused_attn import QKVFormat
+from transformer_engine.pytorch.quantized_tensor import Quantizer
 
 
 __all__ = ["RotaryPositionEmbedding", "apply_rotary_pos_emb", "apply_fused_qkv_rotary_pos_emb"]
@@ -473,6 +478,9 @@ def apply_fused_qkv_rotary_pos_emb(
     cu_seqlens: Union[torch.Tensor, None] = None,  # pylint: disable=unused-argument
     cp_size: int = 1,
     cp_rank: int = 0,
+    bias: Union[torch.Tensor, None] = None,
+    qkv_quantizer: Optional[Quantizer] = None,
+    grad_qkv_quantizer: Optional[Quantizer] = None,
 ) -> torch.Tensor:
     """
     Apply rotary positional embedding tensor to the input qkv tensor.
@@ -519,6 +527,21 @@ def apply_fused_qkv_rotary_pos_emb(
         Context parallel world size.
     cp_rank : int, default = 0.
         Context parallel rank.
+    bias : torch.Tensor, default = None.
+        Bias of the linear that produced `qkv`, added before RoPE; its gradient comes back
+        through autograd.
+    qkv_quantizer : Quantizer, default = None.
+        Float8CurrentScalingQuantizer of the DotProductAttention that consumes q, k and v
+        (``DotProductAttention.get_qkv_quantizer()``): they are returned as Float8Tensors
+        sharing one scale, with the amax taken in the RoPE pass.
+    grad_qkv_quantizer : Quantizer, default = None.
+        MXFP8Quantizer of the linear that produced `qkv` (its ``get_grad_output_quantizer()``):
+        the gradient with respect to `qkv` is returned quantized, rowwise and columnwise.
+
+    `bias`, `qkv_quantizer` and `grad_qkv_quantizer` select the fused RoPE + quantize kernel,
+    which takes `qkv` of shape `[s, b, h * (dq + dk + dv)]`; see
+    :func:`~transformer_engine.pytorch.attention.fused_qkv_rope_quantize.fused_qkv_rope_quantize_supported`
+    for what it supports.
     """
 
     # `start_positions` is only supported for `cp_size=1` and inference.
@@ -527,6 +550,24 @@ def apply_fused_qkv_rotary_pos_emb(
     ), """start_positions != None with CP SIZE > 1 is not supported!"""
 
     assert tensor_format != "thd", "'thd' tensor_format not supported currently."
+
+    if bias is not None or qkv_quantizer is not None or grad_qkv_quantizer is not None:
+        assert fused_qkv_rope_quantize_supported(
+            qkv,
+            q_freqs,
+            k_freqs,
+            qkv_split_arg_list,
+            qkv_quantizer,
+            grad_qkv_quantizer,
+            bias,
+            tensor_format=tensor_format,
+            start_positions=start_positions,
+            interleaved=interleaved,
+            cp_size=cp_size,
+        ), "bias, qkv_quantizer and grad_qkv_quantizer need the fused RoPE + quantize kernel."
+        return FusedQKVRoPEQuantizeFunc.apply(
+            qkv, bias, q_freqs, qkv_split_arg_list, qkv_quantizer, grad_qkv_quantizer
+        )
 
     return FusedQKVRoPEFunc.apply(
         qkv,

@@ -1360,6 +1360,14 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         self.fast_setattr("fp8_meta_tensors_initialized", True)
 
+    def get_grad_output_quantizer(self) -> Optional[Quantizer]:
+        """The quantizer applied to the incoming gradient of this module's first GEMM under the
+        current FP8 autocast, or None outside FP8. A producer of that gradient may quantize it
+        with this quantizer; the backward takes a quantized gradient as it is."""
+        if not self.fp8 or not self.quantizers["scaling_bwd"]:
+            return None
+        return self.quantizers["scaling_bwd"][int(tex.FP8BwdTensors.GRAD_OUTPUT1)]
+
     def get_fp8_meta_tensors(self) -> None:
         """Get scales and amaxes."""
         fwd_key, bwd_key = "scaling_fwd", "scaling_bwd"

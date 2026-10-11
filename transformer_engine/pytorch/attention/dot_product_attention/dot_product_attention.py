@@ -32,6 +32,7 @@ from transformer_engine.pytorch.quantization import (
     Float8CurrentScalingRecipeState,
     Float8BlockScalingRecipeState,
 )
+from transformer_engine.pytorch.quantized_tensor import Quantizer
 from transformer_engine.pytorch.tensor.storage.float8_tensor_storage import Float8TensorStorage
 from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
@@ -1355,6 +1356,16 @@ class DotProductAttention(TransformerEngineBaseModule):
             )
             # Clear cached workspaces as they were created with the old recipe/quantizer type
             self._fp8_workspaces.clear()
+
+    def get_qkv_quantizer(self) -> Optional[Quantizer]:
+        """The quantizer applied to Q/K/V under the current FP8 autocast, or None when
+        attention does not run in FP8. A producer of Q/K/V may quantize them with it ahead of
+        the forward (``apply_fused_qkv_rotary_pos_emb``); quantized Q/K/V are taken as they are.
+        """
+        self.init_fp8_metadata(num_gemms=3)
+        if not (self.fp8 and self.fp8_meta["recipe"].fp8_dpa):
+            return None
+        return self.quantizers["scaling_fwd"][dpa_utils.META_QKV]
 
     def get_qkv_quantization_capabilities(self) -> Tuple[bool, bool]:
         """Return MHA boundary capabilities from the canonical QKV quantizer.
