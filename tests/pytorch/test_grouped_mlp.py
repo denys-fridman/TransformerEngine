@@ -2557,6 +2557,65 @@ class TestGroupedMLPFusedOp:
             on["fc2_dw"], off["fc2_dw"], rtol=self._RECOMPUTE_FC2_WGRAD_RMS_TOL[quantization]
         )
 
+    @pytest.mark.parametrize("activation", ("scaled_swiglu", "scaled_clamped_qgeglu"))
+    def test_grouped_mlp_fc1_dbias_from_wgrad_gemm(
+        self,
+        activation: str,
+        monkeypatch,
+        traced_cudnn_grouped_glu_wrappers,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device = "cuda",
+        group_size: int = 4,
+        hidden_size: int = 256,
+    ) -> None:
+        """FC1's bias gradient from a ones-operand wgrad GEMM matches the epilogue's.
+
+        ``NVTE_CUTEDSL_FUSED_GROUPED_MLP_DBIAS_GEMM=1`` turns the dactivation kernel's
+        dbias reduction off and sums the quantized FC1 grad output with a grouped wgrad
+        GEMM instead; everything else runs the same kernels on the same inputs.
+        """
+        if not mxfp8_available:
+            pytest.skip(reason_for_no_mxfp8)
+        if not te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported():
+            pytest.skip("Fused grouped MLP (CuTeDSL) is not supported on this system")
+        if te.ops.fused.GroupedMLP_CuTeGEMMGLU.grouped_gemm_wgrad_kernel() is None:
+            pytest.skip("cuDNN grouped wgrad kernel is disabled")
+        if grouped_mlp_module._cudnn_wgrad_workspace_size_fn() is None:
+            pytest.skip("Installed cuDNN frontend lacks a caller-owned wgrad descriptor workspace")
+
+        # Including an empty group.
+        split_sizes = torch.tensor(
+            [256 * i for i in range(group_size)], dtype=torch.int64, device=device
+        )
+        common = dict(
+            activation=activation,
+            activation_recompute_in_mlp=False,
+            quantization="mxfp8",
+            split_sizes=split_sizes,
+            group_size=group_size,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            device=device,
+            bias=True,
+        )
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP_DBIAS_GEMM", raising=False)
+        off = self._run_recompute_case(**common)
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP_DBIAS_GEMM", "1")
+        on = self._run_recompute_case(**common)
+
+        bwd_calls = [call for call in traced_cudnn_grouped_glu_wrappers if call["kind"] == "bwd"]
+        assert [call["generate_dbias"] for call in bwd_calls] == [True, False]
+
+        for name in ("y", "dx", "fc1_dw", "fc2_dw"):
+            torch.testing.assert_close(on[name], off[name], rtol=0, atol=0)
+        # dprob and FC2's scaled-bias gradient are accumulated with atomics.
+        atomics_tols = {"rtol": 0.05, "atol": 0.015625}
+        torch.testing.assert_close(on["dprobs"], off["dprobs"], **atomics_tols)
+        torch.testing.assert_close(on["fc2_db"], off["fc2_db"], **atomics_tols)
+        # The GEMM sums the MXFP8 grad output; the epilogue summed it before quantization.
+        torch.testing.assert_close(on["fc1_db"], off["fc1_db"], **quantization_tols("mxfp8"))
+
     @pytest.mark.parametrize("quantization", ("mxfp8", "nvfp4_rht"))
     def test_grouped_mlp_caller_buffers(
         self,
