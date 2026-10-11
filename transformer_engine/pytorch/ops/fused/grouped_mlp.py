@@ -743,6 +743,88 @@ def _cudnn_compute_wgrad(
         )
 
 
+def _fc1_dbias_from_wgrad_gemm() -> bool:
+    """Whether to take the FC1 bias gradient from a ones-operand wgrad GEMM.
+
+    ``NVTE_CUTEDSL_FUSED_GROUPED_MLP_DBIAS_GEMM=1`` moves the FC1 bias gradient out of
+    the cuDNN dactivation epilogue, whose per-column reduction is the most expensive
+    part of that kernel, into a grouped wgrad GEMM of the quantized FC1 grad output
+    against ones (see ``_cudnn_grouped_column_sums``).
+    """
+    return int(os.getenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP_DBIAS_GEMM", "0")) > 0
+
+
+# Rows of the ones operand: one MXFP8 scale block. Every row of the GEMM result is the
+# same column sum; the kernel pads the M tile.
+_ONES_GEMM_ROWS = 32
+
+
+@functools.lru_cache(maxsize=None)
+def _ones_mxfp8_operand(
+    total_tokens: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(_ONES_GEMM_ROWS, total_tokens)`` of exact MXFP8 ones in the wgrad kernel's DY^T layout.
+
+    E4M3 1.0 (0x38) with E8M0 scales of 2^0 (127), so the GEMM sums the dequantized
+    operand exactly. Cached so CUDA graph replays see stable pointers.
+    """
+    data = torch.full(
+        (total_tokens * _ONES_GEMM_ROWS,), 0x38, dtype=torch.uint8, device=device
+    ).view(torch.float8_e4m3fn)
+    scales = torch.full(
+        (
+            round_up_to_nearest_multiple(_ONES_GEMM_ROWS, 128),
+            total_tokens // MXFP8_BLOCK_SCALING_SIZE,
+        ),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    ).view(torch.float8_e8m0fnu)
+    return data.view(total_tokens, _ONES_GEMM_ROWS).T, scales
+
+
+def _cudnn_grouped_column_sums(
+    grouped_dy: GroupedTensor,
+    offsets: torch.Tensor,
+    wgrad_kernel_fn: Callable,
+    descriptor_workspace: torch.Tensor,
+    current_stream,
+) -> torch.Tensor:
+    """Per-group column sums of a GEMM-ready MXFP8 grad output, fp32 ``(num_groups, features)``.
+
+    The cuDNN grouped wgrad kernel runs with the grad output in the X slot and
+    ``_ONES_GEMM_ROWS`` rows of ones in the DY^T slot, so each group's result is the
+    column sum of the quantized values its weight gradient GEMM consumes.
+    """
+    total_tokens, features = grouped_dy.logical_shape
+    num_groups = offsets.shape[0]
+    device = grouped_dy.columnwise_data.device
+    if total_tokens == 0:
+        return torch.zeros((num_groups, features), dtype=torch.float32, device=device)
+    ones_data, ones_scales = _ones_mxfp8_operand(total_tokens, device)
+    out = torch.empty((num_groups, _ONES_GEMM_ROWS, features), dtype=torch.float32, device=device)
+    wgrad_kernel_fn(
+        a_tensor=ones_data,
+        b_tensor=grouped_dy.columnwise_data.view(dtype=torch.float8_e4m3fn).view(
+            total_tokens, features
+        ),
+        sfa_tensor=ones_scales,
+        sfb_tensor=grouped_dy.columnwise_scale_inv.view(
+            round_up_to_nearest_multiple(features, 128), -1
+        ).view(dtype=torch.float8_e8m0fnu),
+        offsets_tensor=offsets,
+        acc_dtype=torch.float32,
+        sf_vec_size=MXFP8_BLOCK_SCALING_SIZE,
+        accumulate_on_output=False,
+        current_stream=current_stream,
+        output_mode="dense",
+        wgrad_tensor=out,
+        wgrad_dtype=out.dtype,
+        descriptor_workspace=descriptor_workspace,
+    )
+    return out[:, 0, :]
+
+
 def _compute_grad_params(
     fc_op,
     ctx,
@@ -2214,6 +2296,18 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             scales_tensor = scales_f32.reshape(-1, 1, 1)
             dscales_tensor = torch.zeros_like(scales_tensor)
 
+        # FC1 bias gradient from a ones-operand wgrad GEMM over the MXFP8 FC1 grad output
+        # the dactivation kernel writes, instead of its epilogue's reduction.
+        wgrad_kernel_fn = self.grouped_gemm_wgrad_kernel()
+        fc1_dbias_from_gemm = (
+            fc1_op.has_bias
+            and not use_nvfp4
+            and not use_dense_single_group
+            and wgrad_kernel_fn is not None
+            and _cudnn_wgrad_workspace_size_fn() is not None
+            and _fc1_dbias_from_wgrad_gemm()
+        )
+
         fc2_d_dtype = torch.bfloat16 if use_nvfp4 else torch.float8_e4m3fn
         if use_nvfp4:
             nvfp4_fp4_max = 6.0
@@ -2250,7 +2344,7 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             "alpha_tensor": fc2_alpha_tensor,
             "prob_tensor": scales_tensor,
             "dprob_tensor": dscales_tensor,
-            "generate_dbias": fc1_op.has_bias,
+            "generate_dbias": fc1_op.has_bias and not fc1_dbias_from_gemm,
             "norm_const_tensor": fc2_norm_const_tensor,
             "d_dtype": fc2_d_dtype,
             "cd_major": "n",
@@ -2475,17 +2569,6 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         if grad_scales is not None:
             grad_scales = grad_scales.to(dtype=dtype)
 
-        fc1_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
-        fc1_bias_grad_packed: Optional[torch.Tensor] = None
-        if fc1_op.has_bias:
-            dbias_t = fc2_dgrad_kernel_out["dbias_tensor"]
-            if dbias_t is not None:
-                dbias_2d = dbias_t.squeeze(-1).to(dtype=dtype)
-                if fc1_op.single_grouped_bias:
-                    fc1_bias_grad_packed = dbias_2d
-                else:
-                    fc1_bias_grads = [dbias_2d[group_idx] for group_idx in range(num_groups)]
-
         # FC1 grad output for dgrad and wgrad GEMMs
         fc1_dy_tensor_offsets = fc1_out_tensor_offsets
         fc1_grad_output_quantizer = fc1_ctx.grad_output_quantizers[0]
@@ -2518,8 +2601,31 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 with_gemm_swizzled_scales=True,
             )
 
+        fc1_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
+        fc1_bias_grad_packed: Optional[torch.Tensor] = None
+        if fc1_op.has_bias:
+            if fc1_dbias_from_gemm:
+                dbias_2d = _cudnn_grouped_column_sums(
+                    grouped_fc1_dy,
+                    split_points.to(dtype=torch.int32),
+                    wgrad_kernel_fn,
+                    _cudnn_wgrad_workspace(
+                        "FC1 bias", split_points.shape[0], "dense", "tensor2d", torch.device(device)
+                    ),
+                    current_stream,
+                )
+            else:
+                dbias_2d = fc2_dgrad_kernel_out["dbias_tensor"]
+                if dbias_2d is not None:
+                    dbias_2d = dbias_2d.squeeze(-1)
+            if dbias_2d is not None:
+                dbias_2d = dbias_2d.to(dtype=dtype)
+                if fc1_op.single_grouped_bias:
+                    fc1_bias_grad_packed = dbias_2d
+                else:
+                    fc1_bias_grads = [dbias_2d[group_idx] for group_idx in range(num_groups)]
+
         # FC2 wgrad GEMM
-        wgrad_kernel_fn = self.grouped_gemm_wgrad_kernel()
         fc2_grad_params = _compute_grad_params(
             fc_op=fc2_op,
             ctx=fc2_ctx,
