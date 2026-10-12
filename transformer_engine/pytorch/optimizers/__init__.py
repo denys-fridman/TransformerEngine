@@ -13,7 +13,9 @@ from transformer_engine_torch import (
     multi_tensor_adam_capturable,
     multi_tensor_adam_capturable_master,
     multi_tensor_sgd,
+    flat_adam_capturable_master,
 )
 from .fused_adam import FusedAdam
 from .fused_sgd import FusedSGD
+from .flat_adam import flat_adam_segments
 from .multi_tensor_apply import MultiTensorApply, multi_tensor_applier

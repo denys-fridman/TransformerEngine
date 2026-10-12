@@ -696,6 +696,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Compute and apply gradient update to parameters for Adam optimizer with CUDA graph "
         "support, LR scheduling and FP32 master weights",
         py::call_guard<py::gil_scoped_release>());
+  m.def("flat_adam_capturable_master",
+        &transformer_engine::pytorch::flat_adam_capturable_master_cuda,
+        "Compute and apply gradient update to one contiguous buffer for Adam optimizer with CUDA "
+        "graph support, LR scheduling and FP32 master weights",
+        py::call_guard<py::gil_scoped_release>());
   m.def("multi_tensor_sgd", &transformer_engine::pytorch::multi_tensor_sgd_cuda,
         "Fused SGD optimizer for list of contiguous tensors",
         py::call_guard<py::gil_scoped_release>());
