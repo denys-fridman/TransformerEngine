@@ -9,9 +9,11 @@ import pytest
 import torch
 from torch import nn
 import transformer_engine.pytorch as te
+import transformer_engine_torch as tex
 from transformer_engine.common.recipe import DelayedScaling, MXFP8BlockScaling, Float8BlockScaling
 from transformer_engine.pytorch import MultiheadAttention, quantized_model_init, is_bf16_available
 from transformer_engine.pytorch import QuantizedTensor
+from transformer_engine.pytorch.optimizers import flat_adam_segments, multi_tensor_applier
 from transformer_engine.pytorch.optimizers.fused_adam import (
     _MAX_TENSORS_PER_MULTI_TENSOR_ADAM_CALL,
 )
@@ -1246,3 +1248,180 @@ class TestAdamTest:
         optimizer2 = torch.optim.Adam(params2, lr=self.lr)
         torch.testing.assert_close(t, t2)
         torch.cuda.synchronize()
+
+
+def _assert_bitwise_equal(actual, expected):
+    int_dtype = {2: torch.int16, 4: torch.int32}
+    assert torch.equal(
+        actual.view(int_dtype[actual.element_size()]),
+        expected.view(int_dtype[expected.element_size()]),
+    )
+
+
+class TestFlatAdam:
+    """flat_adam_capturable_master: one launch over flat buffers, bitwise the multi-tensor kernel."""
+
+    numel = 70001  # several blocks, not a multiple of the 8 elements per thread
+    # (offset, numel, param group): two param groups, padding at 1020 and at the end, a param
+    # group change inside one 8-element vector.
+    pieces = [(0, 1000, 0), (1000, 20, 1), (1024, 3003, 0), (4096, 100, 1), (4200, 65000, 0)]
+    beta1 = [0.9, 0.9]
+    beta2 = [0.999, 0.95]
+    eps = [1e-8, 1e-5]
+    weight_decay = [0.0, 0.1]
+    bias_correction = [1, 1]
+    dtypes = [
+        (torch.bfloat16, torch.bfloat16, torch.float32),
+        (torch.float16, torch.float16, torch.float32),
+        (torch.float32, torch.float32, torch.float32),
+        (torch.bfloat16, torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+    ]
+
+    def _buffers(self, param_dtype, grad_dtype, moment_dtype):
+        """grad, param, exp_avg, exp_avg_sq, master_param."""
+        torch.manual_seed(1234)
+        master = torch.randn(self.numel, device="cuda")
+        return [
+            torch.randn(self.numel, device="cuda").to(grad_dtype),
+            master.to(param_dtype),
+            (torch.randn(self.numel, device="cuda") * 1e-3).to(moment_dtype),
+            (torch.rand(self.numel, device="cuda") * 1e-4).to(moment_dtype),
+            master,
+        ]
+
+    def _scalars(self):
+        """noop, lr per group, step per group, inv_scale."""
+        return (
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            [torch.full([1], 1e-3, device="cuda"), torch.full([1], 2e-3, device="cuda")],
+            [torch.ones(1, dtype=torch.int32, device="cuda") for _ in range(2)],
+            torch.full([1], 0.5, device="cuda"),
+        )
+
+    def _multi_tensor_step(self, buffers, noop, lrs, steps, mode, inv_scale):
+        """One multi-tensor launch per param group over views of the pieces."""
+        for group in range(2):
+            lists = [[] for _ in buffers]
+            for offset, count, piece_group in self.pieces:
+                if piece_group == group:
+                    for tensor_list, buffer in zip(lists, buffers):
+                        tensor_list.append(buffer[offset : offset + count])
+            multi_tensor_applier(
+                tex.multi_tensor_adam_capturable_master,
+                noop,
+                lists,
+                lrs[group],
+                self.beta1[group],
+                self.beta2[group],
+                self.eps[group],
+                steps[group],
+                mode,
+                self.bias_correction[group],
+                self.weight_decay[group],
+                inv_scale,
+            )
+
+    def _flat_step(self, buffers, noop, lrs, steps, mode, inv_scale, store_scaled_grad):
+        seg_starts, seg_groups = flat_adam_segments(self.pieces, self.numel, "cuda")
+        tex.flat_adam_capturable_master(
+            *buffers,
+            noop,
+            seg_starts,
+            seg_groups,
+            lrs,
+            self.beta1,
+            self.beta2,
+            self.eps,
+            steps,
+            mode,
+            self.bias_correction,
+            self.weight_decay,
+            inv_scale,
+            store_scaled_grad,
+        )
+
+    @pytest.mark.parametrize("param_dtype,grad_dtype,moment_dtype", dtypes)
+    @pytest.mark.parametrize("mode", [0, 1])
+    @pytest.mark.parametrize("store_scaled_grad", [False, True])
+    def test_matches_multi_tensor_kernel(
+        self, param_dtype, grad_dtype, moment_dtype, mode, store_scaled_grad
+    ):
+        """Params, master params and moments are bitwise those of the multi-tensor kernel over
+        several steps; the padding between the pieces stays untouched."""
+        if torch.bfloat16 in (param_dtype, grad_dtype, moment_dtype) and not is_bf16_available():
+            pytest.skip("BF16 is not supported")
+        ref = self._buffers(param_dtype, grad_dtype, moment_dtype)
+        tst = [buffer.clone() for buffer in ref]
+        noop, lrs, steps, inv_scale = self._scalars()
+        for step in range(1, 4):
+            for lr, step_tensor in zip(lrs, steps):
+                lr.mul_(0.9)
+                step_tensor.fill_(step)
+            grad = torch.randn(self.numel, device="cuda").to(grad_dtype)
+            ref[0].copy_(grad)
+            tst[0].copy_(grad)
+            self._multi_tensor_step(ref, noop, lrs, steps, mode, inv_scale)
+            self._flat_step(tst, noop, lrs, steps, mode, inv_scale, store_scaled_grad)
+            for actual, expected in zip(tst[1:], ref[1:]):
+                _assert_bitwise_equal(actual, expected)
+            _assert_bitwise_equal(tst[0], ref[0] if store_scaled_grad else grad)
+
+    def test_noop(self):
+        """A set noop flag leaves every buffer as it is."""
+        buffers = self._buffers(torch.bfloat16, torch.bfloat16, torch.float32)
+        before = [buffer.clone() for buffer in buffers]
+        noop, lrs, steps, inv_scale = self._scalars()
+        noop.fill_(1)
+        self._flat_step(buffers, noop, lrs, steps, 1, inv_scale, True)
+        for actual, expected in zip(buffers, before):
+            _assert_bitwise_equal(actual, expected)
+
+    def test_cuda_graph(self):
+        """A captured launch follows the device lr, step, inv_scale and noop values at replay."""
+        ref = self._buffers(torch.bfloat16, torch.bfloat16, torch.float32)
+        tst = [buffer.clone() for buffer in ref]
+        noop, lrs, steps, inv_scale = self._scalars()
+        # Warm up on a side stream, then capture (the buffers are static).
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            noop.fill_(1)
+            self._flat_step(tst, noop, lrs, steps, 1, inv_scale, False)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._flat_step(tst, noop, lrs, steps, 1, inv_scale, False)
+        noop.fill_(0)
+        for step, scale in ((1, 0.5), (2, 0.25), (3, 1.0)):
+            for lr, step_tensor in zip(lrs, steps):
+                lr.mul_(0.9)
+                step_tensor.fill_(step)
+            inv_scale.fill_(scale)
+            grad = torch.randn(self.numel, device="cuda").to(torch.bfloat16)
+            ref[0].copy_(grad)
+            tst[0].copy_(grad)
+            self._multi_tensor_step(ref, noop, lrs, steps, 1, inv_scale)
+            graph.replay()
+            for actual, expected in zip(tst[1:], ref[1:]):
+                _assert_bitwise_equal(actual, expected)
+        noop.fill_(1)
+        before = [buffer.clone() for buffer in tst]
+        graph.replay()
+        for actual, expected in zip(tst, before):
+            _assert_bitwise_equal(actual, expected)
+
+    def test_segments(self):
+        """The segment table merges adjacent runs of a param group and marks the gaps."""
+        seg_starts, seg_groups = flat_adam_segments(
+            [(16, 8, 1), (0, 8, 0), (8, 8, 0), (40, 8, 0), (32, 0, 1)], 64, "cpu"
+        )
+        assert seg_starts.tolist() == [0, 16, 24, 40, 48, 64]
+        assert seg_groups.tolist() == [0, 1, -1, 0, -1]
+        assert seg_starts.dtype == torch.int64 and seg_groups.dtype == torch.int32
+        seg_starts, seg_groups = flat_adam_segments([], 8, "cpu")
+        assert seg_starts.tolist() == [0, 8] and seg_groups.tolist() == [-1]
+        with pytest.raises(ValueError, match="Overlapping"):
+            flat_adam_segments([(0, 8, 0), (4, 8, 0)], 16, "cpu")
+        with pytest.raises(ValueError, match="extend"):
+            flat_adam_segments([(0, 8, 0), (8, 9, 0)], 16, "cpu")
