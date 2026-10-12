@@ -9,6 +9,10 @@
 #include <transformer_engine/multi_tensor.h>
 #include <transformer_engine/transformer_engine.h>
 
+#include <algorithm>
+#include <limits>
+#include <vector>
+
 #include "../utils.cuh"
 #include "multi_tensor_apply.cuh"
 
@@ -572,6 +576,190 @@ struct AdamCapturableMasterFunctor {
   }
 };
 
+// Adam with FP32 master weights over one contiguous buffer (nvte_flat_adam_capturable_master_cuda):
+// the update of AdamCapturableMasterFunctor, element for element, in one launch over flat grad /
+// param / exp_avg / exp_avg_sq / master buffers that share an element index, e.g. a distributed
+// optimizer's shard of a parameter bucket. The param group of an element comes from a sorted
+// segment table: elements [seg_starts[i], seg_starts[i + 1]) belong to group seg_groups[i], or
+// are padding and left untouched when seg_groups[i] < 0.
+constexpr int kFlatAdamMaxGroups = 8;
+constexpr int kFlatAdamMaxSegments = 1024;
+constexpr int kFlatAdamElementsPerThread = 8;  // 16 bytes of a 16-bit grad or param
+constexpr int kFlatAdamThreads = 128;
+
+struct FlatAdamGroup {
+  const float *lr;
+  const int *step;
+  float beta1, beta2, epsilon, weight_decay;
+  int bias_correction;
+};
+
+struct FlatAdamGroups {
+  FlatAdamGroup group[kFlatAdamMaxGroups];
+  int count;
+};
+
+// Same expressions, in the same order, as AdamCapturableMasterFunctor: the results are bitwise
+// identical to that kernel's.
+__device__ __forceinline__ void flat_adam_update(MATH_T &r_g, MATH_T &r_p,
+                                                 MATH_T &r_m,                     // NOLINT(*)
+                                                 MATH_T &r_v, const float beta1,  // NOLINT(*)
+                                                 const float beta2, const float beta1_correction,
+                                                 const float beta2_correction, const float epsilon,
+                                                 const float lr, adamMode_t mode,
+                                                 const float decay) {
+  if (mode == ADAM_MODE_0) {  // L2
+    r_g = r_g + (decay * r_p);
+    r_m = beta1 * r_m + (1 - beta1) * r_g;
+    r_v = beta2 * r_v + (1 - beta2) * r_g * r_g;
+    MATH_T next_m_unbiased = r_m / beta1_correction;
+    MATH_T next_v_unbiased = r_v / beta2_correction;
+    MATH_T denom = sqrtf(next_v_unbiased) + epsilon;
+    MATH_T update = next_m_unbiased / denom;
+    r_p = r_p - (lr * update);
+  } else {  // weight decay
+    r_m = beta1 * r_m + (1 - beta1) * r_g;
+    r_v = beta2 * r_v + (1 - beta2) * r_g * r_g;
+    MATH_T next_m_unbiased = r_m / beta1_correction;
+    MATH_T next_v_unbiased = r_v / beta2_correction;
+    MATH_T denom = sqrtf(next_v_unbiased) + epsilon;
+    MATH_T update = (next_m_unbiased / denom) + (decay * r_p);
+    r_p = r_p - (lr * update);
+  }
+}
+
+// Streaming 16-byte loads and stores of kFlatAdamElementsPerThread elements.
+template <typename T>
+__device__ __forceinline__ void flat_adam_load(const T *ptr,
+                                               MATH_T (&r)[kFlatAdamElementsPerThread]) {
+  static_assert(sizeof(T) == 2 || sizeof(T) == 4, "16-bit or 32-bit elements");
+  constexpr int kPerVector = 16 / sizeof(T);
+  const uint4 *src = reinterpret_cast<const uint4 *>(ptr);
+#pragma unroll
+  for (int v = 0; v < kFlatAdamElementsPerThread / kPerVector; ++v) {
+    Vec<T, kPerVector> vec;
+    vec.data.vec = __ldcs(src + v);
+#pragma unroll
+    for (int i = 0; i < kPerVector; ++i) {
+      r[v * kPerVector + i] = static_cast<MATH_T>(vec.data.elt[i]);
+    }
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void flat_adam_store(T *ptr,
+                                                const MATH_T (&r)[kFlatAdamElementsPerThread]) {
+  constexpr int kPerVector = 16 / sizeof(T);
+  uint4 *dst = reinterpret_cast<uint4 *>(ptr);
+#pragma unroll
+  for (int v = 0; v < kFlatAdamElementsPerThread / kPerVector; ++v) {
+    Vec<T, kPerVector> vec;
+#pragma unroll
+    for (int i = 0; i < kPerVector; ++i) {
+      vec.data.elt[i] = static_cast<T>(r[v * kPerVector + i]);
+    }
+    __stcs(dst + v, vec.data.vec);
+  }
+}
+
+template <typename PARAM_T, typename GRAD_T, typename FULL_T, typename MOMENT_T>
+__global__ void __launch_bounds__(kFlatAdamThreads)
+    flat_adam_capturable_master_kernel(GRAD_T *g, PARAM_T *p, MOMENT_T *m, MOMENT_T *v,
+                                       FULL_T *p_master, const int64_t n, volatile int *noop_gmem,
+                                       const int64_t *seg_starts, const int *seg_groups,
+                                       const int num_segments, const FlatAdamGroups groups,
+                                       const adamMode_t mode, const float *inv_scale,
+                                       const bool store_scaled_grad) {
+  if (*noop_gmem == 1) return;
+
+  __shared__ int64_t s_start[kFlatAdamMaxSegments + 1];
+  __shared__ int s_group[kFlatAdamMaxSegments];
+  __shared__ float s_lr[kFlatAdamMaxGroups], s_beta1_correction[kFlatAdamMaxGroups],
+      s_beta2_correction[kFlatAdamMaxGroups], s_beta1[kFlatAdamMaxGroups],
+      s_beta2[kFlatAdamMaxGroups], s_epsilon[kFlatAdamMaxGroups], s_decay[kFlatAdamMaxGroups];
+  for (int i = threadIdx.x; i <= num_segments; i += blockDim.x) s_start[i] = seg_starts[i];
+  for (int i = threadIdx.x; i < num_segments; i += blockDim.x) s_group[i] = seg_groups[i];
+  if (threadIdx.x < groups.count) {
+    const FlatAdamGroup &group = groups.group[threadIdx.x];
+    const float beta1 = group.beta1, beta2 = group.beta2;
+    float beta1_correction = 1.0f, beta2_correction = 1.0f;
+    if (group.bias_correction == 1) {
+      beta1_correction = 1 - pow(beta1, *group.step);
+      beta2_correction = 1 - pow(beta2, *group.step);
+    }
+    s_lr[threadIdx.x] = *group.lr;
+    s_beta1_correction[threadIdx.x] = beta1_correction;
+    s_beta2_correction[threadIdx.x] = beta2_correction;
+    s_beta1[threadIdx.x] = beta1;
+    s_beta2[threadIdx.x] = beta2;
+    s_epsilon[threadIdx.x] = group.epsilon;
+    s_decay[threadIdx.x] = group.weight_decay;
+  }
+  __syncthreads();
+
+  const MATH_T scale = *inv_scale;
+  constexpr int kElements = kFlatAdamElementsPerThread;
+  const int64_t num_vectors = (n + kElements - 1) / kElements;
+  for (int64_t vector = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       vector < num_vectors; vector += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t start = vector * kElements;
+    // Segment holding the first element: the last one starting at or before it.
+    int lo = 0, hi = num_segments;
+    while (hi - lo > 1) {
+      const int mid = (lo + hi) / 2;
+      if (s_start[mid] <= start) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    if (start + kElements <= s_start[lo + 1]) {
+      // The whole vector lies in one segment.
+      const int group = s_group[lo];
+      if (group < 0) continue;
+      MATH_T r_g[kElements], r_p[kElements], r_m[kElements], r_v[kElements];
+      flat_adam_load(g + start, r_g);
+      flat_adam_load(p_master + start, r_p);
+      flat_adam_load(m + start, r_m);
+      flat_adam_load(v + start, r_v);
+#pragma unroll
+      for (int i = 0; i < kElements; ++i) r_g[i] *= scale;
+      if (store_scaled_grad) flat_adam_store(g + start, r_g);
+#pragma unroll
+      for (int i = 0; i < kElements; ++i) {
+        flat_adam_update(r_g[i], r_p[i], r_m[i], r_v[i], s_beta1[group], s_beta2[group],
+                         s_beta1_correction[group], s_beta2_correction[group], s_epsilon[group],
+                         s_lr[group], mode, s_decay[group]);
+      }
+      flat_adam_store(p + start, r_p);
+      flat_adam_store(p_master + start, r_p);
+      flat_adam_store(m + start, r_m);
+      flat_adam_store(v + start, r_v);
+    } else {
+      // The vector crosses a segment boundary or the end of the buffer: element by element.
+      int segment = lo;
+      for (int i = 0; i < kElements && start + i < n; ++i) {
+        const int64_t index = start + i;
+        while (segment + 1 < num_segments && s_start[segment + 1] <= index) ++segment;
+        const int group = s_group[segment];
+        if (group < 0) continue;
+        MATH_T r_g = static_cast<MATH_T>(g[index]) * scale;
+        if (store_scaled_grad) g[index] = static_cast<GRAD_T>(r_g);
+        MATH_T r_p = static_cast<MATH_T>(p_master[index]);
+        MATH_T r_m = static_cast<MATH_T>(m[index]);
+        MATH_T r_v = static_cast<MATH_T>(v[index]);
+        flat_adam_update(r_g, r_p, r_m, r_v, s_beta1[group], s_beta2[group],
+                         s_beta1_correction[group], s_beta2_correction[group], s_epsilon[group],
+                         s_lr[group], mode, s_decay[group]);
+        p[index] = static_cast<PARAM_T>(r_p);
+        p_master[index] = static_cast<FULL_T>(r_p);
+        m[index] = static_cast<MOMENT_T>(r_m);
+        v[index] = static_cast<MOMENT_T>(r_v);
+      }
+    }
+  }
+}
+
 void multi_tensor_adam_cuda(int chunk_size, Tensor noop_flag,
                             std::vector<std::vector<Tensor *>> tensor_lists, const float lr,
                             const float beta1, const float beta2, const float epsilon,
@@ -977,6 +1165,89 @@ void multi_tensor_adam_capturable_master_cuda(int chunk_size, Tensor noop_flag,
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
+void flat_adam_capturable_master_cuda(
+    const Tensor &grad, const Tensor &param, const Tensor &exp_avg, const Tensor &exp_avg_sq,
+    const Tensor &master_param, const Tensor &noop_flag, const Tensor &seg_starts,
+    const Tensor &seg_groups, const std::vector<Tensor *> &lr, const float *beta1,
+    const float *beta2, const float *epsilon, const std::vector<Tensor *> &step, const int mode,
+    const int *bias_correction, const float *weight_decay, const Tensor &inv_scale,
+    const bool store_scaled_grad, cudaStream_t stream) {
+  const int64_t n = grad.numel();
+  const Tensor *buffers[] = {&param, &exp_avg, &exp_avg_sq, &master_param};
+  const char *buffer_names[] = {"param", "exp_avg", "exp_avg_sq", "master_param"};
+  for (size_t i = 0; i < 4; ++i) {
+    NVTE_CHECK(static_cast<int64_t>(buffers[i]->numel()) == n, "Expected ", buffer_names[i],
+               " to have ", n, " elements like grad, but found ", buffers[i]->numel());
+  }
+  NVTE_CHECK(exp_avg.dtype() == exp_avg_sq.dtype(),
+             "First and second moment tensors must have the same dtype, but found ",
+             to_string(exp_avg.dtype()), " and ", to_string(exp_avg_sq.dtype()));
+  NVTE_CHECK(master_param.dtype() == DType::kFloat32,
+             "Master param tensor has dtype=", to_string(master_param.dtype()),
+             ", but expected dtype=", to_string(DType::kFloat32));
+  NVTE_CHECK(noop_flag.dtype() == DType::kInt32 && noop_flag.numel() == 1,
+             "noop_flag must be a single Int32 element");
+  NVTE_CHECK(inv_scale.dtype() == DType::kFloat32 && inv_scale.numel() == 1,
+             "inv_scale must be a single Float32 element");
+  const size_t num_segments = seg_groups.numel();
+  NVTE_CHECK(seg_groups.dtype() == DType::kInt32 && num_segments >= 1 &&
+                 num_segments <= static_cast<size_t>(kFlatAdamMaxSegments),
+             "seg_groups must be Int32 with 1 to ", kFlatAdamMaxSegments, " segments, but found ",
+             to_string(seg_groups.dtype()), " with ", num_segments);
+  NVTE_CHECK(seg_starts.dtype() == DType::kInt64 && seg_starts.numel() == num_segments + 1,
+             "seg_starts must be Int64 with one more element than seg_groups");
+  const size_t num_groups = lr.size();
+  NVTE_CHECK(num_groups >= 1 && num_groups <= static_cast<size_t>(kFlatAdamMaxGroups),
+             "Expected 1 to ", kFlatAdamMaxGroups, " param groups, but found ", num_groups);
+  NVTE_CHECK(step.size() == num_groups, "Expected ", num_groups, " step tensors, but found ",
+             step.size());
+  NVTE_CHECK(mode == ADAM_MODE_0 || mode == ADAM_MODE_1, "Invalid Adam mode ", mode);
+  for (const auto *tensor : {&grad, &param, &exp_avg, &exp_avg_sq, &master_param}) {
+    NVTE_CHECK(reinterpret_cast<uintptr_t>(tensor->data.dptr) % 16 == 0,
+               "grad, param, exp_avg, exp_avg_sq and master_param must be 16-byte aligned");
+  }
+  FlatAdamGroups groups{};
+  groups.count = static_cast<int>(num_groups);
+  for (size_t i = 0; i < num_groups; ++i) {
+    NVTE_CHECK(lr[i]->dtype() == DType::kFloat32 && lr[i]->numel() == 1, "lr of param group ", i,
+               " must be a single Float32 element");
+    NVTE_CHECK(step[i]->dtype() == DType::kInt32 && step[i]->numel() == 1, "step of param group ",
+               i, " must be a single Int32 element");
+    groups.group[i] = FlatAdamGroup{reinterpret_cast<const float *>(lr[i]->data.dptr),
+                                    reinterpret_cast<const int *>(step[i]->data.dptr),
+                                    beta1[i],
+                                    beta2[i],
+                                    epsilon[i],
+                                    weight_decay[i],
+                                    bias_correction[i]};
+  }
+  if (n == 0) return;
+
+  const int64_t num_vectors = (n + kFlatAdamElementsPerThread - 1) / kFlatAdamElementsPerThread;
+  const int grid = static_cast<int>(std::min<int64_t>(
+      (num_vectors + kFlatAdamThreads - 1) / kFlatAdamThreads, std::numeric_limits<int>::max()));
+  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+      param.dtype(), p_in_type,
+      TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+          grad.dtype(), g_in_type,
+          TRANSFORMER_ENGINE_TYPE_SWITCH_FP32_BF16(
+              exp_avg.dtype(), moment_type,
+              flat_adam_capturable_master_kernel<p_in_type, g_in_type, float, moment_type>
+              <<<grid, kFlatAdamThreads, 0, stream>>>(
+                  reinterpret_cast<g_in_type *>(grad.data.dptr),
+                  reinterpret_cast<p_in_type *>(param.data.dptr),
+                  reinterpret_cast<moment_type *>(exp_avg.data.dptr),
+                  reinterpret_cast<moment_type *>(exp_avg_sq.data.dptr),
+                  reinterpret_cast<float *>(master_param.data.dptr), n,
+                  reinterpret_cast<int *>(noop_flag.data.dptr),
+                  reinterpret_cast<const int64_t *>(seg_starts.data.dptr),
+                  reinterpret_cast<const int *>(seg_groups.data.dptr),
+                  static_cast<int>(num_segments), groups, static_cast<adamMode_t>(mode),
+                  reinterpret_cast<const float *>(inv_scale.data.dptr), store_scaled_grad);)))
+
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
 }  // namespace multi_tensor_adam
 }  // namespace transformer_engine
 
@@ -1053,4 +1324,28 @@ void nvte_multi_tensor_adam_capturable_master_cuda(
       convert_tensor_array(tensor_lists, num_tensor_lists, num_tensors_per_list),
       *convertNVTETensorCheck(lr), beta1, beta2, epsilon, *convertNVTETensorCheck(step), mode,
       bias_correction, weight_decay, *convertNVTETensorCheck(inv_scale), stream);
+}
+
+void nvte_flat_adam_capturable_master_cuda(
+    NVTETensor grad, NVTETensor param, NVTETensor exp_avg, NVTETensor exp_avg_sq,
+    NVTETensor master_param, NVTETensor noop_flag, NVTETensor seg_starts, NVTETensor seg_groups,
+    const NVTETensor *lr, const float *beta1, const float *beta2, const float *epsilon,
+    const NVTETensor *step, const int mode, const int *bias_correction, const float *weight_decay,
+    const size_t num_groups, NVTETensor inv_scale, const int store_scaled_grad,
+    cudaStream_t stream) {
+  NVTE_API_CALL(nvte_flat_adam_capturable_master_cuda);
+  using namespace transformer_engine;
+
+  std::vector<Tensor *> lr_tensors, step_tensors;
+  for (size_t i = 0; i < num_groups; ++i) {
+    lr_tensors.push_back(convertNVTETensorCheck(lr[i]));
+    step_tensors.push_back(convertNVTETensorCheck(step[i]));
+  }
+  multi_tensor_adam::flat_adam_capturable_master_cuda(
+      *convertNVTETensorCheck(grad), *convertNVTETensorCheck(param),
+      *convertNVTETensorCheck(exp_avg), *convertNVTETensorCheck(exp_avg_sq),
+      *convertNVTETensorCheck(master_param), *convertNVTETensorCheck(noop_flag),
+      *convertNVTETensorCheck(seg_starts), *convertNVTETensorCheck(seg_groups), lr_tensors, beta1,
+      beta2, epsilon, step_tensors, mode, bias_correction, weight_decay,
+      *convertNVTETensorCheck(inv_scale), store_scaled_grad != 0, stream);
 }

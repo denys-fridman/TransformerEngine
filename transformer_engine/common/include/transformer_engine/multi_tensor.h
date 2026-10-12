@@ -203,6 +203,48 @@ void nvte_multi_tensor_adam_capturable_master_cuda(
     const float epsilon, NVTETensor step, const int mode, const int bias_correction,
     const float weight_decay, NVTETensor inv_scale, cudaStream_t stream);
 
+/*!  \brief Compute and apply the Adam update with CUDA graph support, LR scheduling and FP32
+ *          master weights to one contiguous buffer, e.g. a distributed optimizer's shard of a
+ *          parameter bucket.
+ *
+ *  The same update as nvte_multi_tensor_adam_capturable_master_cuda, bitwise, in one launch over
+ *  flat buffers that share an element index. A sorted segment table assigns elements to param
+ *  groups: elements [seg_starts[i], seg_starts[i + 1]) belong to group seg_groups[i], or are
+ *  padding and left untouched when seg_groups[i] is negative. Per-group arguments are arrays of
+ *  num_groups entries.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in,out]  grad                    Gradient buffer, scaled by inv_scale in place when
+ *                                          store_scaled_grad is set.
+ *  \param[out]     param                   Parameter buffer.
+ *  \param[in,out]  exp_avg                 First moment buffer.
+ *  \param[in,out]  exp_avg_sq              Second moment buffer.
+ *  \param[in,out]  master_param            FP32 master parameter buffer.
+ *  \param[in]      noop_flag               If this single element tensor has non-zero value, kernel will exit immediately.
+ *  \param[in]      seg_starts              Int64 element offsets of the segments, num_segments + 1 entries ending with the buffer size.
+ *  \param[in]      seg_groups              Int32 param group of each segment, negative for padding.
+ *  \param[in]      lr                      Learning rate of each param group (single element tensors).
+ *  \param[in]      beta1                   Coefficient for first moment of gradient of each param group.
+ *  \param[in]      beta2                   Coefficient for second moment of gradient of each param group.
+ *  \param[in]      epsilon                 Term added to the denominator for numerical stability of each param group.
+ *  \param[in]      step                    Iteration counter of each param group (single element Int32 tensors).
+ *  \param[in]      mode                    Whether to use AdamW (L2 penalty applied to params).
+ *  \param[in]      bias_correction         Whether to apply correction factor for moment estimates, per param group.
+ *  \param[in]      weight_decay            L2 penalty for weight decay of each param group.
+ *  \param[in]      num_groups              Number of param groups (at most 8).
+ *  \param[in]      inv_scale               Scalar for the unscaling operation.
+ *  \param[in]      store_scaled_grad       Whether to write the unscaled gradient back to grad.
+ *  \param[in]      stream                  CUDA stream used for this operation.
+ */
+void nvte_flat_adam_capturable_master_cuda(
+    NVTETensor grad, NVTETensor param, NVTETensor exp_avg, NVTETensor exp_avg_sq,
+    NVTETensor master_param, NVTETensor noop_flag, NVTETensor seg_starts, NVTETensor seg_groups,
+    const NVTETensor *lr, const float *beta1, const float *beta2, const float *epsilon,
+    const NVTETensor *step, const int mode, const int *bias_correction, const float *weight_decay,
+    const size_t num_groups, NVTETensor inv_scale, const int store_scaled_grad,
+    cudaStream_t stream);
+
 /*!  \brief Compute and apply gradient update to parameters for SGD optimizer.
  *
  * \warning   This API is **experimental** and subject to change.
