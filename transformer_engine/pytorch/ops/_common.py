@@ -28,7 +28,7 @@ from ..tensor import (
     NVFP4Quantizer,
 )
 from ..tensor.float8_tensor import Float8Tensor
-from ..tensor.mxfp8_tensor import MXFP8Tensor
+from ..tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from ..utils import canonicalize_dtype
 
 
@@ -78,7 +78,7 @@ def quantize_grad_input(grad_input: torch.Tensor, quantizer: Quantizer) -> Quant
     quantizer = quantizer.copy()
     quantizer.set_usage(rowwise=True, columnwise=True)
     out = quantizer(grad_input)
-    if isinstance(out, MXFP8Tensor):
+    if isinstance(out, MXFP8TensorStorage):
         out._high_precision_data = grad_input
     return out
 
