@@ -169,6 +169,45 @@ void nvte_rmsnorm_bwd_add(const NVTETensor dz, const NVTETensor x, const NVTETen
                           NVTETensor dgamma, NVTETensor workspace, const int multiprocessorCount,
                           const bool zero_centered_gamma, cudaStream_t stream);
 
+/*! \brief Compute backward of RMSNorm in one pass over dz and x, with optional fusions.
+ *
+ *  dx = dz * gamma * rsigma - x * rsigma^3 / H * sum(dz * gamma * x) (+ add), rounded to the
+ *  input type and either stored, or quantized to MXFP8 with rowwise (1x32) and columnwise (32x1)
+ *  scales when dx is an MXFP8 tensor (compact or GEMM-swizzled scales; the padding of the scale
+ *  matrices along H is written as zero, the padding along N is left untouched). dgamma, and the
+ *  column sum dbias of the rounded dx if requested, are reduced in the kernel in a fixed order,
+ *  so they are deterministic. Requires compute capability 9.0+.
+ *
+ *  Calling this function with workspace set to an empty tensor will not perform the operation,
+ *  but instead set the shape and type of the workspace tensor to the required values.
+ *
+ *  \param[in]     dz                  Incoming gradient tensor of shape [..., H], BF16 or FP16.
+ *  \param[in]     x                   Forward input tensor of shape [..., H], the dtype of dz.
+ *                                     N, the product of the leading dimensions, and H are
+ *                                     multiples of 32; H is at most 3072.
+ *  \param[in]     rsigma              Reciprocal of the root mean square of the input
+ *                                     calculated over the last dimension. Shape: [N].
+ *  \param[in]     gamma               Gamma tensor of shape [H], the dtype of x.
+ *  \param[in]     add                 Optional tensor of shape [..., H] added to dx; NULL or
+ *                                     empty to skip.
+ *  \param[out]    dx                  Output gradient of shape [..., H] in the dtype of x, or
+ *                                     an MXFP8 tensor with rowwise and columnwise data.
+ *  \param[out]    dgamma              Gradient for gamma tensor of shape [H], in the dtype of
+ *                                     gamma or FP32.
+ *  \param[out]    dbias               Optional column sum of dx, shape [H], the dtype of dgamma;
+ *                                     NULL or empty to skip.
+ *  \param[out]    workspace           Workspace tensor.
+ *  \param[in,out] counter             Int32 tensor of at least 73 elements, zero before the
+ *                                     call, used to order the reduction and left zero afterwards.
+ *  \param[in]     zero_centered_gamma Multiply normalized values by @f$ \gamma+1 @f$ instead of @f$ \gamma @f$
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor x, const NVTETensor rsigma,
+                            const NVTETensor gamma, const NVTETensor add, NVTETensor dx,
+                            NVTETensor dgamma, NVTETensor dbias, NVTETensor workspace,
+                            NVTETensor counter, const bool zero_centered_gamma,
+                            cudaStream_t stream);
+
 /*! \brief Set whether to enable cuDNN backend for normalization forward.
  *
  *  \param[in]  enable  Whether to enable cuDNN backend.
