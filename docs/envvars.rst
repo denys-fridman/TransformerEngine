@@ -440,16 +440,16 @@ LayerNorm/RMSNorm SM Margins
 .. envvar:: NVTE_RMSNORM_BWD_BACKEND
 
    :Type: ``str``
-   :Default: ``auto``
+   :Default: ``triton``
    :Description: Kernel of the fused RMSNorm backward pass selected by
                  :envvar:`NVTE_RMSNORM_BWD_USE_TRITON`. ``cuda`` is a CUDA kernel that reads
                  the gradient and the input once and reduces the weight gradient in the kernel,
                  in a fixed order; it takes FP16 or BF16 tensors with a multiple of 32 rows and
                  a multiple of 32 columns up to 3072, on compute capability 9.0+, and writes
                  the gradient in one format, so a quantized output stays with the Triton
-                 kernel. ``triton`` is the Triton kernel. ``auto`` picks the CUDA kernel on
-                 Blackwell and later where it applies and the Triton kernel elsewhere. The two
-                 kernels agree within floating-point accumulation error.
+                 kernel. ``triton`` (the default) is the Triton kernel. ``auto`` picks the CUDA
+                 kernel on Blackwell and later where it applies and the Triton kernel
+                 elsewhere. The two kernels agree within floating-point accumulation error.
 
 .. envvar:: NVTE_FWD_LAYERNORM_SM_MARGIN
 

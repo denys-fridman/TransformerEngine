@@ -7,9 +7,10 @@
 ``NVTE_RMSNORM_BWD_USE_TRITON=1`` routes the RMSNorm backward calls that :func:`is_supported`
 accepts to one streaming kernel that computes the input gradient, adds a residual gradient to it,
 emits it as an MXFP8 tensor when the consuming operation takes one, and reduces the weight
-gradient; every other call stays on the C++ extension. On Blackwell and later the kernel is the
-CUDA one (``tex.rmsnorm_bwd_fused``, which reads its inputs once and reduces the weight gradient
-in the kernel), elsewhere the Triton one; ``NVTE_RMSNORM_BWD_BACKEND=cuda|triton`` forces either.
+gradient; every other call stays on the C++ extension. The kernel is the Triton one unless
+``NVTE_RMSNORM_BWD_BACKEND=cuda`` selects the CUDA one (``tex.rmsnorm_bwd_fused``, which reads its
+inputs once and reduces the weight gradient in the kernel) or ``NVTE_RMSNORM_BWD_BACKEND=auto``
+selects it on Blackwell and later where it applies.
 """
 
 from __future__ import annotations
@@ -80,12 +81,14 @@ def is_supported(
 def _use_cuda_kernel(
     dy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, add: Optional[torch.Tensor]
 ) -> bool:
-    """CUDA kernel on Blackwell and later, Triton elsewhere, unless the backend is forced.
+    """Triton kernel unless ``NVTE_RMSNORM_BWD_BACKEND`` is ``cuda``, or ``auto`` on Blackwell
+    and later.
 
     The CUDA kernel takes 16-byte aligned FP16 or BF16 tensors with M and N multiples of 32 and
-    N up to 3072.
+    N up to 3072. It is opt-in: on a 20B MoE training step it measured slower than the Triton
+    kernel pair where it applies.
     """
-    backend = os.getenv("NVTE_RMSNORM_BWD_BACKEND", "auto").lower()
+    backend = os.getenv("NVTE_RMSNORM_BWD_BACKEND", "triton").lower()
     if backend not in ("auto", "cuda", "triton"):
         raise ValueError(f"NVTE_RMSNORM_BWD_BACKEND must be auto, cuda or triton, got {backend!r}.")
     if backend == "triton":
