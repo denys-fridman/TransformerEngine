@@ -455,6 +455,43 @@ def test_grouped_linear_accuracy_delay_wgrad_compute_side_stream(
         torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
 
+def test_weight_grad_store_side_stream_holds_inputs():
+    """A store on its own stream keeps a popped computation's inputs, the closure's included,
+    until the putting stream has waited on the computation, max_in_flight pops later."""
+    import weakref
+    from functools import partial
+
+    from transformer_engine.pytorch.module._common import WeightGradStore
+
+    stream = torch.cuda.Stream()
+    WeightGradStore.release_in_flight(stream)
+    store = WeightGradStore(delay_wgrad_compute=True)
+    store.set_stream(stream)
+    out = torch.zeros(64, 64, device="cuda")
+
+    def accumulate(x, y, scale):
+        out.addmm_(x.t(), y, alpha=float(scale.numel()))
+
+    refs = []
+    for _ in range(WeightGradStore.max_in_flight + 2):
+        x = torch.randn(32, 64, device="cuda")
+        y = torch.randn(32, 64, device="cuda")
+        scale = torch.ones(3, device="cuda")  # only the closure references it
+        refs.append((weakref.ref(x), weakref.ref(scale)))
+        store.put([x, y], partial(accumulate, scale=scale))
+        del x, y, scale
+        with store.stream_context():
+            store.pop()
+        torch.cuda.current_stream().synchronize()
+
+    alive = [r[0]() is not None and r[1]() is not None for r in refs]
+    assert alive[0] is False and alive[1] is False, "the oldest computations were released"
+    assert all(alive[2:]), f"the last {WeightGradStore.max_in_flight} stay referenced"
+    assert len(WeightGradStore._in_flight[stream]) == WeightGradStore.max_in_flight
+    WeightGradStore.release_in_flight(stream)
+    assert all(r[0]() is None and r[1]() is None for r in refs)
+
+
 @pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4)
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=str)
 @pytest.mark.parametrize("num_gemms", [1, 3])

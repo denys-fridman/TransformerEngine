@@ -4,6 +4,7 @@
 
 """Internal function used by multiple modules."""
 
+import collections
 import contextlib
 import dataclasses
 import queue
@@ -273,6 +274,17 @@ class WeightGradStore:
     This class enables split backward propagation for better memory efficiency.
     """
 
+    # A computation popped on a stream of its own stays referenced (tensor list and closure)
+    # until the stream that put it has waited on its completion. ``record_stream`` alone does
+    # not keep its memory from being reused meanwhile: it covers neither what the closure
+    # captures (e.g. the expert offsets of a grouped wgrad) nor tensors the caching allocator
+    # does not own (the views ``bulk_allocate`` hands out), whose blocks return to the putting
+    # stream's pool as soon as the Python references go. The wait is placed ``max_in_flight``
+    # popped computations later, on the putting stream, so the side stream keeps a backlog of
+    # that many computations before the putting stream depends on one of them.
+    max_in_flight = 8
+    _in_flight: dict = {}
+
     def __init__(self, delay_wgrad_compute=False, ub_bulk_wgrad=False):
         """
         Initialize the WeightGradStore.
@@ -299,10 +311,10 @@ class WeightGradStore:
 
         ``pop`` then launches the stored computation on ``stream`` once the work the
         current stream had enqueued at ``put`` (the producers of the stored tensors)
-        has completed, with a cuBLAS workspace of its own, and marks the stored tensors
-        as used by ``stream`` so that releasing them afterwards is safe. The caller owns
-        ``stream`` and synchronizes with it before consuming the gradients. ``None``
-        restores the default.
+        has completed, with a cuBLAS workspace of its own, marks the stored tensors as
+        used by ``stream`` and keeps the computation referenced until the putting stream
+        has waited on its completion (``max_in_flight``). The caller owns ``stream`` and
+        synchronizes with it before consuming the gradients. ``None`` restores the default.
         """
         self.stream = stream
 
@@ -340,8 +352,11 @@ class WeightGradStore:
         assert self.enabled is True, "delay_wgrad_compute is not enabled"
         # With a stream of its own, the computation is ordered after the producers of the
         # tensors, which the current stream has enqueued by now.
-        ready = torch.cuda.current_stream().record_event() if self.stream is not None else None
-        self.context.put([tensor_list, func, ready])
+        if self.stream is None:
+            self.context.put([tensor_list, func, None, None])
+            return
+        putting_stream = torch.cuda.current_stream()
+        self.context.put([tensor_list, func, putting_stream.record_event(), putting_stream])
 
     def pop(self):
         """
@@ -350,7 +365,7 @@ class WeightGradStore:
         """
         assert self.enabled is True, "delay_wgrad_compute is not enabled"
         if self.context.qsize() > 0:
-            tensor_list, func, ready = self.context.get()
+            tensor_list, func, ready, putting_stream = self.context.get()
             if self.stream is None:
                 return func(*tensor_list), tensor_list
             self.stream.wait_event(ready)
@@ -358,11 +373,37 @@ class WeightGradStore:
                 tex.get_cublas_workspace(self.stream.device.index, False, False, self.stream)
             ):
                 _record_stream(tensor_list, self.stream)
-                return func(*tensor_list), tensor_list
+                result = func(*tensor_list)
+                self._hold(tensor_list, func, self.stream.record_event(), putting_stream)
+            return result, tensor_list
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             raise RuntimeError(f"Pop empty queue. rank {rank}")
         raise RuntimeError("Pop empty queue. No distributed environment detected.")
+
+    def _hold(self, tensor_list, func, done, putting_stream):
+        """Keep a popped computation referenced until ``putting_stream`` waited on ``done``."""
+        capturing = torch.cuda.is_current_stream_capturing()
+        pending = WeightGradStore._in_flight.setdefault(self.stream, collections.deque())
+        pending.append((tensor_list, func, done, putting_stream, capturing))
+        while len(pending) > self.max_in_flight:
+            _, _, old_done, old_stream, old_capturing = pending.popleft()
+            # An event recorded under graph capture cannot be waited on outside it, nor the
+            # reverse; the capture boundary itself synchronizes the streams.
+            if old_capturing == capturing:
+                old_stream.wait_event(old_done)
+
+    @classmethod
+    def release_in_flight(cls, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """
+        Drop the references to the computations still held for ``stream`` (all streams when
+        None) without waiting on them, for a caller that has ordered the putting streams
+        after the side streams' work by other means, e.g. at the end of an iteration.
+        """
+        if stream is None:
+            cls._in_flight.clear()
+        else:
+            cls._in_flight.pop(stream, None)
 
     def assert_empty(self):
         """

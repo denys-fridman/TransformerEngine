@@ -350,7 +350,11 @@ class GroupedLinear(BasicOperation):
             _, tensor_list = self.wgrad_store.pop()
             activations = tensor_list[0]
             grad_weights = tensor_list[2]
-            if isinstance(activations, list):
+            if self.wgrad_store.stream is not None:
+                # The store keeps the activations until the caller's stream has waited on
+                # the GEMM; clearing them here would hand their memory back to it meanwhile.
+                pass
+            elif isinstance(activations, list):
                 clear_tensor_data(*activations)
             else:
                 # Fused MXFP8 grouped MLP saves `GroupedTensor` activations for wgrad.
