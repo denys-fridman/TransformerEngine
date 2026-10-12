@@ -85,7 +85,8 @@ def rmsnorm_bwd(
 
     Returns the input gradient (plus ``add``) with shape ``out_shape`` (default: x's), either in
     x's dtype or, with ``quantizer``, as the MXFP8 tensor it builds, with both the rowwise and
-    the columnwise copies, and the weight gradient in the weight's dtype.
+    the columnwise copies and the values in x's dtype kept as its high-precision data, and the
+    weight gradient in the weight's dtype.
     """
     M, N = x.shape
     if out_shape is None:
@@ -93,8 +94,9 @@ def rmsnorm_bwd(
     rows = triton.cdiv(M, MXFP8_BLOCK_SCALING_SIZE)
     dw_part = torch.empty((rows, N), dtype=torch.float32, device=x.device)
 
+    dx_out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
     if quantizer is None:
-        dx = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+        dx = dx_out
         fp8_max_rcp = 0.0
         rowwise_data = rowwise_scale = columnwise_data = columnwise_scale = dw_part
         swizzled = False
@@ -103,6 +105,9 @@ def rmsnorm_bwd(
         quantizer = quantizer.copy()
         quantizer.set_usage(rowwise=True, columnwise=True)
         dx = quantizer.make_empty(out_shape, dtype=x.dtype, device=x.device)
+        # For consumers that need the values before quantization (bias gradients,
+        # accumulation with other gradients)
+        dx._high_precision_data = dx_out
         fp8_dtype = TE_DType_To_Torch[quantizer.dtype]
         fp8_max_rcp = 1.0 / torch.finfo(fp8_dtype).max
         rowwise_data = dx._rowwise_data.view(fp8_dtype)
@@ -121,7 +126,7 @@ def rmsnorm_bwd(
         rstd,
         weight,
         dy if add is None else add,
-        dx if quantizer is None else dw_part,
+        dx_out,
         dw_part,
         rowwise_data,
         rowwise_scale,
@@ -134,7 +139,6 @@ def rmsnorm_bwd(
         columnwise_scale.shape[1] if quantizer is not None else 0,
         ZERO_CENTERED_GAMMA=zero_centered_gamma,
         HAS_ADD=add is not None,
-        STORE_DX=quantizer is None,
         ROWWISE=quantizer is not None,
         COLUMNWISE=quantizer is not None,
         SWIZZLED_SCALES=swizzled,

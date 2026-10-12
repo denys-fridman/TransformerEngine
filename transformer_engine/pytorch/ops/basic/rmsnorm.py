@@ -30,6 +30,7 @@ from .._common import (
     get_grad_input_quantizer,
     maybe_autocast_dtype,
     maybe_dequantize,
+    quantize_grad_input,
 )
 
 
@@ -256,6 +257,8 @@ class RMSNorm(BasicOperation):
                 self.zero_centered_gamma,
             )
             grad_input = dx.view(grad_output.size())
+            if quantizer is not None:
+                grad_input = quantize_grad_input(grad_input, quantizer)
 
         # Clear saved tensors if possible
         clear_tensor_data(x)

@@ -12,7 +12,7 @@ import torch
 import transformer_engine.pytorch as te
 import transformer_engine.pytorch.ops as te_ops
 import transformer_engine_torch as tex
-from transformer_engine.pytorch import MXFP8Quantizer
+from transformer_engine.pytorch import MXFP8Quantizer, MXFP8Tensor
 from transformer_engine.pytorch.triton import rmsnorm_bwd as triton_rmsnorm_bwd
 
 from utils import dtype_tols, make_recipe, quantization_tols, reset_rng_states
@@ -139,6 +139,10 @@ def test_mxfp8_output(shape, fp8_dtype, optimize_for_gemm):
             dx_q._columnwise_scale_inv[: M // 32, :N], ref._columnwise_scale_inv[: M // 32, :N]
         )
     assert torch.equal(dw_q, dw)
+    # The gradient before quantization is kept and is what dequantize returns
+    assert torch.equal(dx_q._high_precision_data, dx)
+    assert torch.equal(dx_q.dequantize(), dx)
+    assert torch.equal(dx_q.view(-1, N).dequantize(), dx.view(-1, N))
 
 
 @pytest.mark.parametrize("dtype", _dtypes)
@@ -229,3 +233,43 @@ def test_ops_linear_add_rmsnorm_mxfp8(with_extra_grad, monkeypatch, kernel_calls
     tols = quantization_tols("mxfp8")
     for grad_triton, grad_cpp in zip(*grads):
         torch.testing.assert_close(grad_triton, grad_cpp, **tols)
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize("with_extra_grad", (False, True))
+def test_ops_quantize_add_rmsnorm_mxfp8(with_extra_grad, monkeypatch, kernel_calls):
+    """A Quantize op quantizing in the backward pass gets the MXFP8 grad from the fused
+    backward (or from the quantizer on the C++ path) with the gradient before quantization
+    kept, so that the input's other gradient accumulates with it exactly."""
+    shape, N = (64, 256), 256
+    dtype = torch.bfloat16
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    dy1 = torch.randn(shape, dtype=dtype, device="cuda")
+    dy2 = torch.randn(shape, dtype=dtype, device="cuda")
+    dy3 = torch.randn(shape, dtype=dtype, device="cuda")
+    recipe = make_recipe("mxfp8")
+    grads = {}
+    for quantize in (True, False):
+        for enabled in ("1", "0"):
+            monkeypatch.setenv("NVTE_RMSNORM_BWD_USE_TRITON", enabled)
+            reset_rng_states()
+            ops = [te_ops.MakeExtraOutput(), te_ops.RMSNorm(N, device="cuda", dtype=dtype)]
+            if quantize:
+                ops.insert(0, te_ops.Quantize(forward=False, backward=True))
+            model = te_ops.Sequential(*ops)
+            x_test = x.clone().requires_grad_()
+            with te.autocast(enabled=True, recipe=recipe):
+                y1, y2 = model(x_test)
+            # x_test gets a second gradient that autograd accumulates with the Sequential's
+            loss = (y1 * dy1).sum() + (x_test * dy3).sum()
+            if with_extra_grad:
+                loss = loss + (y2 * dy2).sum()
+            loss.backward()
+            grads[quantize, enabled] = x_test.grad
+    assert len(kernel_calls) == 2
+    assert isinstance(kernel_calls[0]["quantizer"], MXFP8Quantizer)
+    assert kernel_calls[1]["quantizer"] is None
+    for enabled in ("1", "0"):
+        assert not isinstance(grads[True, enabled], MXFP8Tensor)
+        assert torch.equal(grads[True, enabled], grads[False, enabled])
+    torch.testing.assert_close(grads[True, "1"], grads[True, "0"], **dtype_tols(dtype))

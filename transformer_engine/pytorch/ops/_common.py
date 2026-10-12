@@ -28,6 +28,7 @@ from ..tensor import (
     NVFP4Quantizer,
 )
 from ..tensor.float8_tensor import Float8Tensor
+from ..tensor.mxfp8_tensor import MXFP8Tensor
 from ..utils import canonicalize_dtype
 
 
@@ -63,6 +64,23 @@ def get_grad_input_quantizer(
     if FP8GlobalStateManager.get_fp8_recipe().backward_override is not None:
         return None
     return prev_op_grad_output_quantizer
+
+
+def quantize_grad_input(grad_input: torch.Tensor, quantizer: Quantizer) -> QuantizedTensorStorage:
+    """Quantize a grad input for the preceding operation's backward.
+
+    Both copies are made since the consumer chooses the ones it needs
+    only in its own backward pass. An MXFP8 tensor keeps the
+    high-precision values, so that consumers that need them (bias
+    gradients, accumulation with other gradients) do not dequantize.
+
+    """
+    quantizer = quantizer.copy()
+    quantizer.set_usage(rowwise=True, columnwise=True)
+    out = quantizer(grad_input)
+    if isinstance(out, MXFP8Tensor):
+        out._high_precision_data = grad_input
+    return out
 
 
 def validate_buffer(

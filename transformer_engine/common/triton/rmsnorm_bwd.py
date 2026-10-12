@@ -57,7 +57,6 @@ def rmsnorm_bwd_kernel(
     columnwise_scale_stride,
     ZERO_CENTERED_GAMMA: tl.constexpr,
     HAS_ADD: tl.constexpr,
-    STORE_DX: tl.constexpr,
     ROWWISE: tl.constexpr,
     COLUMNWISE: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr,
@@ -69,9 +68,9 @@ def rmsnorm_bwd_kernel(
     """RMSNorm backward for one block of ROWS rows of dy, x [M, N] and rstd [M].
 
     dx = rstd * dy * w - x * rstd^3 / N * sum(dy * w * x) (+ add), rounded to OUT_DTYPE, is stored
-    to dx (STORE_DX) and/or quantized to MXFP8 with rowwise (32 columns) and columnwise (the
-    block's 32 rows) e8m0 scales in the compact or GEMM-swizzled layout. The block's fp32 partial
-    sums of dw = sum(dy * x * rstd) go to dw_part[program, :].
+    to dx and, with ROWWISE / COLUMNWISE, quantized to MXFP8 with rowwise (32 columns) and
+    columnwise (the block's 32 rows) e8m0 scales in the compact or GEMM-swizzled layout. The
+    block's fp32 partial sums of dw = sum(dy * x * rstd) go to dw_part[program, :].
     """
     pid = tl.program_id(0)
     rows = pid.to(tl.int64) * ROWS + tl.arange(0, ROWS)
@@ -106,8 +105,7 @@ def rmsnorm_bwd_kernel(
         if HAS_ADD:
             dx += tl.load(add_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         dx = dx.to(OUT_DTYPE)
-        if STORE_DX:
-            tl.store(dx_ptr + offs, dx, mask=mask)
+        tl.store(dx_ptr + offs, dx, mask=mask)
         dw_part = tl.sum(dy * x * rstd[:, None], axis=0)
         tl.store(dw_part_ptr + pid.to(tl.int64) * N + cols, dw_part, mask=col_mask)
         if ROWWISE or COLUMNWISE:

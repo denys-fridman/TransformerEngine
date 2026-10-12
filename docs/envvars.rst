@@ -427,9 +427,12 @@ LayerNorm/RMSNorm SM Margins
                  kernels where it applies: contiguous FP32, FP16 or BF16 tensors on CUDA. The
                  kernel also adds the residual gradient of a preceding ``MakeExtraOutput``
                  operation and, when the operation before that consumes its gradient as MXFP8
-                 (for example a ``Linear`` under the MXFP8 recipe), emits the gradient quantized
-                 with rowwise and columnwise scales so that no separate cast is needed. The
-                 weight gradient is reduced from per-block FP32 partial sums, so results match
+                 (for example a ``Linear`` under the MXFP8 recipe, or a ``Quantize`` operation
+                 quantizing in the backward pass), emits the gradient quantized with rowwise and
+                 columnwise scales so that no separate cast is needed, keeping the values before
+                 quantization as the tensor's high-precision data for bias gradients and for
+                 accumulation with other gradients. The weight gradient is reduced from per-block
+                 FP32 partial sums, so results match
                  the C++ kernels within floating-point accumulation error, not bit-for-bit.
                  :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` does not apply to the Triton kernel.
 

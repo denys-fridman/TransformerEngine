@@ -20,7 +20,7 @@ from transformer_engine.pytorch.ops.op import (
 )
 from ...triton import rmsnorm_bwd as triton_rmsnorm_bwd
 from ...utils import clear_tensor_data
-from .._common import maybe_dequantize
+from .._common import maybe_dequantize, quantize_grad_input
 
 
 class BackwardAddRMSNorm(FusedOperation):
@@ -87,6 +87,8 @@ class BackwardAddRMSNorm(FusedOperation):
                 rmsnorm_op.zero_centered_gamma,
             )
             grad_input = dx.view(grad_output.size())
+            if quantizer is not None:
+                grad_input = quantize_grad_input(grad_input, quantizer)
 
         # Clear saved tensors if possible
         clear_tensor_data(x)
