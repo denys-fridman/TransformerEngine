@@ -224,6 +224,15 @@ class MXFP8Quantizer(Quantizer):
 register_value_opaque_quantizer(MXFP8Quantizer)
 
 
+def _view_high_precision_data(
+    tensor: MXFP8TensorStorage, shape: Iterable[int]
+) -> Optional[torch.Tensor]:
+    """View of the tensor's high-precision values, if it keeps them"""
+    if tensor._high_precision_data is None:
+        return None
+    return tensor._high_precision_data.view(*shape)
+
+
 class MXFP8Tensor(MXFP8TensorStorage, QuantizedTensor):
     """Experimental tensor class with FP8 data
 
@@ -293,6 +302,8 @@ class MXFP8Tensor(MXFP8TensorStorage, QuantizedTensor):
         if dtype is None:
             dtype = self.dtype
 
+        if self._high_precision_data is not None:
+            return self._high_precision_data.to(dtype).view(self.size())
         if torch.is_grad_enabled():
             return _FromMXFP8Func.apply(self, dtype)
         return _FromMXFP8Func.forward(None, self, dtype)
@@ -330,11 +341,15 @@ class MXFP8Tensor(MXFP8TensorStorage, QuantizedTensor):
         columnwise_data = None
         if self._columnwise_data is not None:
             columnwise_data = self._columnwise_data.detach().clone()
+        high_precision_data = None
+        if self._high_precision_data is not None:
+            high_precision_data = self._high_precision_data.detach().clone()
         return _IdentityFunc.apply(
             self,
             {
                 "rowwise_data": rowwise_data,
                 "columnwise_data": columnwise_data,
+                "high_precision_data": high_precision_data,
             },
         )
 
@@ -392,6 +407,7 @@ class MXFP8Tensor(MXFP8TensorStorage, QuantizedTensor):
                 fp8_dtype=tensor._fp8_dtype,
                 with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
                 device=tensor.device,
+                high_precision_data=_view_high_precision_data(tensor, shape),
             )
 
         if func == torch.ops.aten.copy_.default:
@@ -991,6 +1007,7 @@ class _ViewFunc(torch.autograd.Function):
             quantizer=tensor._quantizer,
             with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
             device=tensor.device,
+            high_precision_data=_view_high_precision_data(tensor, shape),
         )
 
     @staticmethod
@@ -1019,6 +1036,7 @@ class _ViewFunc(torch.autograd.Function):
                 quantizer=grad._quantizer,
                 with_gemm_swizzled_scales=grad._with_gemm_swizzled_scales,
                 device=grad.device,
+                high_precision_data=_view_high_precision_data(grad, ctx.shape),
             )
             return dgrad, None
         return grad.view(ctx.shape), None
@@ -1081,6 +1099,7 @@ class _ReshapeFunc(torch.autograd.Function):
             quantizer=tensor._quantizer,
             with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
             device=tensor.device,
+            high_precision_data=_view_high_precision_data(tensor, shape),
         )
 
     @staticmethod
@@ -1108,6 +1127,7 @@ class _ReshapeFunc(torch.autograd.Function):
                 quantizer=grad._quantizer,
                 device=grad.device,
                 with_gemm_swizzled_scales=grad._with_gemm_swizzled_scales,
+                high_precision_data=_view_high_precision_data(grad, ctx.shape),
             )
             return dgrad, None
         return grad.view(ctx.shape), None

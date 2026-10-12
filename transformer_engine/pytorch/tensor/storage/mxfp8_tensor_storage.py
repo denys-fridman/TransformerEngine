@@ -84,6 +84,10 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
     # Whether scaling factors are in the swizzled format expected by
     # GEMM
     _with_gemm_swizzled_scales: bool
+    # The values before quantization, when the producer keeps them
+    # for consumers that need high precision alongside the quantized
+    # data (e.g. bias gradients); dequantize returns them
+    _high_precision_data: Optional[torch.Tensor]
 
     def __new__(
         cls,
@@ -96,6 +100,7 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
         with_gemm_swizzled_scales: bool,
         *args,
         fake_dtype: Optional[torch.dtype] = None,
+        high_precision_data: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if cls is MXFP8TensorStorage:
@@ -110,6 +115,7 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
         instance._quantizer = quantizer.copy() if quantizer is not None else None
         instance._fp8_dtype = DType.cast(fp8_dtype)
         instance._with_gemm_swizzled_scales = with_gemm_swizzled_scales
+        instance._high_precision_data = high_precision_data
 
         return instance
 
@@ -120,6 +126,7 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
             self._columnwise_data,
             self._rowwise_scale_inv,
             self._columnwise_scale_inv,
+            self._high_precision_data,
         ):
             if t is not None:
                 t.data = _empty_tensor()
@@ -153,6 +160,7 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
             "quantizer": self._quantizer,
             "with_gemm_swizzled_scales": self._with_gemm_swizzled_scales,
             "fake_dtype": self._dtype,
+            "high_precision_data": self._high_precision_data,
         }
 
     def prepare_for_saving(self) -> Tuple[list[Optional[torch.Tensor]], MXFP8TensorStorage]:
@@ -162,11 +170,13 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
             self._columnwise_data,
             self._rowwise_scale_inv,
             self._columnwise_scale_inv,
+            self._high_precision_data,
         ]
         self._rowwise_data = None
         self._columnwise_data = None
         self._rowwise_scale_inv = None
         self._columnwise_scale_inv = None
+        self._high_precision_data = None
         return tensors, self
 
     def restore_from_saved(
@@ -177,7 +187,8 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
         self._columnwise_data = tensors[1]
         self._rowwise_scale_inv = tensors[2]
         self._columnwise_scale_inv = tensors[3]
-        return tensors[4:]
+        self._high_precision_data = tensors[4]
+        return tensors[5:]
 
     def get_data_tensors(self, rowwise_data: bool = True, columnwise_data: bool = True):
         """Get this Tensor's data."""
@@ -193,6 +204,8 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
         """Dequantize to a higher precision."""
         if dtype is None:
             dtype = self._dtype
+        if self._high_precision_data is not None:
+            return self._high_precision_data.to(dtype).view(self.size())
         if self._rowwise_data is not None and self._rowwise_data.numel() == 0:
             return torch.empty(self.size(), dtype=dtype, device=self.device)
         return _FromMXFP8Func.forward(None, self, dtype)
@@ -248,6 +261,10 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
         if cur_columnwise_data is not None:
             new_columnwise_data = cur_columnwise_data.view(*shape)
 
+        new_high_precision_data = None
+        if self._high_precision_data is not None:
+            new_high_precision_data = self._high_precision_data.view(*shape)
+
         return MXFP8TensorStorage(
             rowwise_data=new_rowwise_data,
             rowwise_scale_inv=self._rowwise_scale_inv,
@@ -257,6 +274,7 @@ class MXFP8TensorStorage(QuantizedTensorStorage):
             quantizer=self._quantizer,
             with_gemm_swizzled_scales=self._with_gemm_swizzled_scales,
             fake_dtype=self._dtype,
+            high_precision_data=new_high_precision_data,
         )
 
     def __repr__(self):
