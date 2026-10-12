@@ -2,8 +2,8 @@
 #
 # See LICENSE for license information.
 
-"""Tests for the gather + MXFP8 group quantize Triton kernel and its use as a pre-quantized
-input / grad output of the fused grouped MLP."""
+"""Tests for the gather + MXFP8 group quantize kernels (CUDA and Triton) and their use as a
+pre-quantized input / grad output of the fused grouped MLP."""
 
 from __future__ import annotations
 
@@ -25,6 +25,12 @@ pytestmark = pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
 @pytest.fixture(autouse=True)
 def _reset_rng_states():
     reset_rng_states()
+
+
+@pytest.fixture(params=("cuda", "triton"))
+def backend(request, monkeypatch):
+    monkeypatch.setenv("NVTE_GATHER_QUANTIZE_MXFP8_BACKEND", request.param)
+    return request.param
 
 
 class _InjectGrad(torch.autograd.Function):
@@ -94,7 +100,7 @@ def _written_scale_entries(split_sizes, hidden):
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("hidden", (128, 2880))
-def test_matches_group_quantize(dtype: torch.dtype, hidden: int) -> None:
+def test_matches_group_quantize(backend: str, dtype: torch.dtype, hidden: int) -> None:
     """The gather + quantize equals tex.group_quantize of the gathered rows, bit for bit."""
     num_tokens, split_sizes, num_rows = 300, [256, 0, 512, 128, 384], 1536
     src = torch.randn(num_tokens, hidden, dtype=dtype, device="cuda") * 3
@@ -139,8 +145,45 @@ def test_matches_group_quantize(dtype: torch.dtype, hidden: int) -> None:
     )
 
 
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("hidden", (160, 2880))
+def test_backends_match(monkeypatch, dtype: torch.dtype, hidden: int) -> None:
+    """The CUDA and Triton kernels write the same bytes, including a partial last scale tile."""
+    num_tokens, split_sizes, num_rows = 500, [128, 1024, 0, 256, 384], 2048
+    src = torch.randn(num_tokens, hidden, dtype=dtype, device="cuda") * 3
+    row_to_token, split_sizes = _make_gather(num_tokens, split_sizes, num_rows)
+    num_used = int(split_sizes.sum().item())
+
+    outputs = {}
+    for backend in ("cuda", "triton"):
+        monkeypatch.setenv("NVTE_GATHER_QUANTIZE_MXFP8_BACKEND", backend)
+        outputs[backend] = gather_quantize_mxfp8(
+            src, row_to_token, split_sizes, _make_quantizer(), keep_high_precision=True
+        )
+    cuda, triton = outputs["cuda"], outputs["triton"]
+
+    used = num_used * hidden
+    rowwise_idx, columnwise_idx = _written_scale_entries(split_sizes, hidden)
+    torch.testing.assert_close(cuda.rowwise_data[:used], triton.rowwise_data[:used], rtol=0, atol=0)
+    torch.testing.assert_close(
+        cuda.columnwise_data[:used], triton.columnwise_data[:used], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        cuda.scale_inv[rowwise_idx], triton.scale_inv[rowwise_idx], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        cuda.columnwise_scale_inv[columnwise_idx],
+        triton.columnwise_scale_inv[columnwise_idx],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        cuda.high_precision_data[:used], triton.high_precision_data[:used], rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("bias", (False, True))
-def test_fused_grouped_mlp_prequantized(bias: bool) -> None:
+def test_fused_grouped_mlp_prequantized(backend: str, bias: bool) -> None:
     """The fused grouped MLP fed the gathered rows and fed their gather + quantize agree bit for
     bit, in the forward (input) and in the backward (grad output with high-precision rows)."""
     fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
