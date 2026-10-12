@@ -102,6 +102,32 @@ void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t strea
 void nvte_group_quantize(const NVTEGroupedTensor input, NVTEGroupedTensor output,
                          const NVTEQuantizationConfig quant_config, cudaStream_t stream);
 
+/*! \brief Gathers rows of the input and casts them to grouped MXFP8 in one pass.
+ *
+ *  Output row r is input row row_to_token[r], or zeros when row_to_token[r] is negative, cast
+ *  the way nvte_group_quantize casts a grouped tensor with GEMM-swizzled scales: rowwise and
+ *  columnwise E4M3 data with one swizzled E8M0 scale tile grid over (rows, hidden) for the rowwise
+ *  scales and one per group for the columnwise scales. The groups are the leading split_sizes
+ *  rows; rows past their sum are left unwritten. Requires compute capability 9.0+.
+ *
+ *  \param[in]     input                  2D BF16/FP16 tensor, hidden size a multiple of 32.
+ *  \param[in]     row_to_token           Int32 input row of every output row, length a
+ *                                        multiple of 128.
+ *  \param[in]     split_sizes            Int64 device tensor of rows per group, each a multiple
+ *                                        of 128, summing to at most the number of output rows.
+ *  \param[in,out] output                 E4M3 MXFP8 tensor with rowwise and columnwise data of
+ *                                        shape (rows, hidden) and the two swizzled scale buffers.
+ *  \param[in,out] high_precision_output  Optional (rows, hidden) tensor of the input's dtype
+ *                                        that receives the gathered rows; NULL or empty to skip.
+ *  \param[in,out] counter                Int32 tensor of 2 elements, zero before the call, used
+ *                                        to hand out work and left zero afterwards.
+ *  \param[in]     stream                 CUDA stream used for the operation.
+ */
+void nvte_gather_quantize_mxfp8(const NVTETensor input, const NVTETensor row_to_token,
+                                const NVTETensor split_sizes, NVTETensor output,
+                                NVTETensor high_precision_output, NVTETensor counter,
+                                cudaStream_t stream);
+
 /*! \brief Casts input tensor to FP8/MXFP8/BlockwiseFP8, providing the option to immediately exit the kernel
  *         based on the value of the 'noop' tensor.
  *         The type of quantized tensor in the output depends on the scaling mode of the output
