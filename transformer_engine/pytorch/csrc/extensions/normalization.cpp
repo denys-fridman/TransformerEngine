@@ -304,8 +304,8 @@ std::vector<py::object> rmsnorm_bwd_add(const at::Tensor &dz, const at::Tensor &
 
 void rmsnorm_bwd_fused(const at::Tensor &dz, const at::Tensor &x, const at::Tensor &rsigma,
                        const at::Tensor &gamma, MaybeTensor add, py::handle dx,
-                       py::handle quantizer, at::Tensor dgamma, MaybeTensor dbias,
-                       at::Tensor counter, const bool zero_centered_gamma) {
+                       py::handle quantizer, MaybeTensor dx_high_precision, at::Tensor dgamma,
+                       MaybeTensor dbias, at::Tensor counter, const bool zero_centered_gamma) {
   NVTE_CHECK(dz.is_contiguous() && x.is_contiguous() && rsigma.is_contiguous() &&
                  gamma.is_contiguous() && (!add.has_value() || add->is_contiguous()),
              "dz, x, rsigma, gamma and add must be contiguous.");
@@ -319,6 +319,10 @@ void rmsnorm_bwd_fused(const at::Tensor &dz, const at::Tensor &x, const at::Tens
     add_cu = makeTransformerEngineTensor(*add);
   }
   auto dx_cu = makeTransformerEngineTensor(dx, quantizer);
+  TensorWrapper dx_hp_cu;
+  if (dx_high_precision.has_value()) {
+    dx_hp_cu = makeTransformerEngineTensor(*dx_high_precision);
+  }
   auto dgamma_cu = makeTransformerEngineTensor(dgamma);
   TensorWrapper dbias_cu;
   if (dbias.has_value()) {
@@ -330,9 +334,9 @@ void rmsnorm_bwd_fused(const at::Tensor &dz, const at::Tensor &x, const at::Tens
   // This call populates tensors with the required config.
   NVTE_SCOPED_GIL_RELEASE({
     nvte_rmsnorm_bwd_fused(dz_cu.data(), x_cu.data(), rsigma_cu.data(), gamma_cu.data(),
-                           add_cu.data(), dx_cu.data(), dgamma_cu.data(), dbias_cu.data(),
-                           workspace.data(), counter_cu.data(), zero_centered_gamma,
-                           at::cuda::getCurrentCUDAStream());
+                           add_cu.data(), dx_cu.data(), dx_hp_cu.data(), dgamma_cu.data(),
+                           dbias_cu.data(), workspace.data(), counter_cu.data(),
+                           zero_centered_gamma, at::cuda::getCurrentCUDAStream());
   });
 
   // Alloc space for Tensors.
@@ -343,9 +347,9 @@ void rmsnorm_bwd_fused(const at::Tensor &dz, const at::Tensor &x, const at::Tens
   // Actual call to bwd kernel.
   NVTE_SCOPED_GIL_RELEASE({
     nvte_rmsnorm_bwd_fused(dz_cu.data(), x_cu.data(), rsigma_cu.data(), gamma_cu.data(),
-                           add_cu.data(), dx_cu.data(), dgamma_cu.data(), dbias_cu.data(),
-                           workspace.data(), counter_cu.data(), zero_centered_gamma,
-                           at::cuda::getCurrentCUDAStream());
+                           add_cu.data(), dx_cu.data(), dx_hp_cu.data(), dgamma_cu.data(),
+                           dbias_cu.data(), workspace.data(), counter_cu.data(),
+                           zero_centered_gamma, at::cuda::getCurrentCUDAStream());
   });
 }
 

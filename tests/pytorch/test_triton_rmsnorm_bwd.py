@@ -172,8 +172,7 @@ def test_mxfp8_output(backend, cuda_kernel_calls, shape, fp8_dtype, optimize_for
     assert torch.equal(dx_q._high_precision_data, dx)
     assert torch.equal(dx_q.dequantize(), dx)
     assert torch.equal(dx_q.view(-1, N).dequantize(), dx.view(-1, N))
-    # The CUDA kernel writes dx in one format: the quantized output stays with the Triton kernel
-    assert len(cuda_kernel_calls) == (1 if backend == "cuda" else 0)
+    assert len(cuda_kernel_calls) == (2 if backend == "cuda" else 0)
 
 
 @pytest.mark.skipif(
@@ -214,7 +213,7 @@ def test_cuda_kernel_dbias(grads_dtype):
     dx = torch.empty_like(x)
     dgamma = torch.empty(shape[1], dtype=grads_dtype, device="cuda")
     dbias = torch.empty(shape[1], dtype=grads_dtype, device="cuda")
-    tex.rmsnorm_bwd_fused(dy, x, rstd, w, add, dx, None, dgamma, dbias, counter, False)
+    tex.rmsnorm_bwd_fused(dy, x, rstd, w, add, dx, None, None, dgamma, dbias, counter, False)
     assert torch.all(counter == 0)
     dx_ref, dw_ref = _reference(dy, x, rstd, w, add, False)
     torch.testing.assert_close(dx.double(), dx_ref, **dtype_tols(torch.bfloat16))
@@ -225,12 +224,14 @@ def test_cuda_kernel_dbias(grads_dtype):
     if mxfp8_available:
         quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
         dx_q = quantizer.make_empty(shape, dtype=torch.bfloat16, device="cuda")
+        dx_hp = torch.empty_like(x)
         dgamma_q = torch.empty_like(dgamma)
         dbias_q = torch.empty_like(dbias)
         tex.rmsnorm_bwd_fused(
-            dy, x, rstd, w, add, dx_q, quantizer, dgamma_q, dbias_q, counter, False
+            dy, x, rstd, w, add, dx_q, quantizer, dx_hp, dgamma_q, dbias_q, counter, False
         )
         assert torch.equal(dgamma_q, dgamma) and torch.equal(dbias_q, dbias)
+        assert torch.equal(dx_hp, dx)
         ref = quantizer(dx)
         assert torch.equal(dx_q._rowwise_data, ref._rowwise_data)
         assert torch.equal(dx_q._columnwise_data, ref._columnwise_data)

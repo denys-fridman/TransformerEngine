@@ -361,8 +361,8 @@ std::vector<py::object> rmsnorm_bwd_add(const at::Tensor &dz, const at::Tensor &
 
 void rmsnorm_bwd_fused(const at::Tensor &dz, const at::Tensor &x, const at::Tensor &rsigma,
                        const at::Tensor &gamma, MaybeTensor add, py::handle dx,
-                       py::handle quantizer, at::Tensor dgamma, MaybeTensor dbias,
-                       at::Tensor counter, const bool zero_centered_gamma);
+                       py::handle quantizer, MaybeTensor dx_high_precision, at::Tensor dgamma,
+                       MaybeTensor dbias, at::Tensor counter, const bool zero_centered_gamma);
 
 std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &weight, float eps,
                                     py::object ln_out, py::handle quantizer, DType otype,

@@ -28,9 +28,10 @@ namespace rmsnorm_bwd_fused {
 // memory and accumulates the per-column partials of dgamma (and of dbias and the columnwise amax)
 // in registers, which the cluster reduces through distributed shared memory into one fp32 partial
 // row per 32-row block. Sweep 3 stores dx, or quantizes it to MXFP8 with rowwise and columnwise
-// scales. The partial rows are reduced in the kernel by the last-arriving CTAs of a three-level
-// tree (ticket counters in global memory), every level a fixed-order sum, so the result is
-// deterministic and no separate reduction kernel is needed.
+// scales (storing it as well when a high-precision copy is requested). The partial rows are
+// reduced in the kernel by the last-arriving CTAs of a three-level tree (ticket counters in global
+// memory), every level a fixed-order sum, so the result is deterministic and no separate reduction
+// kernel is needed.
 constexpr int kThreads = 384;  // one thread per 8 columns
 constexpr int kWarps = kThreads / 32;
 constexpr int kRows = 8;
@@ -50,7 +51,7 @@ struct Params {
   const void *add;      // [M, N] or nullptr
   const float *rsigma;  // [M]
   const void *gamma;    // [N]
-  void *dx;             // [M, N] in the input type, nullptr with MXFP8 output
+  void *dx;             // [M, N] in the input type; with MXFP8 output the optional copy
   uint8_t *rowwise_data;
   uint8_t *columnwise_data;
   e8m0_t *rowwise_scales;
@@ -506,12 +507,13 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_fused_kernel(const Pa
     const int row = row0 + r;
     uint4 a = make_uint4(0u, 0u, 0u, 0u);
     if (owner) a = *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
-    if (!MX) {
+    if (!MX || p.dx != nullptr) {
       if (owner) {
         *reinterpret_cast<uint4 *>(reinterpret_cast<IType *>(p.dx) + static_cast<size_t>(row) * N +
                                    c0) = a;
       }
-    } else {
+    }
+    if (MX) {
       const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
       float v[8];
       float amax = 0.0f;
@@ -614,9 +616,9 @@ bool is_aligned(const void *ptr) { return reinterpret_cast<uintptr_t>(ptr) % 16 
 
 void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor x, const NVTETensor rsigma,
                             const NVTETensor gamma, const NVTETensor add, NVTETensor dx,
-                            NVTETensor dgamma, NVTETensor dbias, NVTETensor workspace,
-                            NVTETensor counter, const bool zero_centered_gamma,
-                            cudaStream_t stream) {
+                            NVTETensor dx_high_precision, NVTETensor dgamma, NVTETensor dbias,
+                            NVTETensor workspace, NVTETensor counter,
+                            const bool zero_centered_gamma, cudaStream_t stream) {
   NVTE_API_CALL(nvte_rmsnorm_bwd_fused);
   using namespace transformer_engine;
   namespace rb = transformer_engine::rmsnorm_bwd_fused;
@@ -628,6 +630,8 @@ void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor x, const NVTET
   const Tensor *add_cpp = add != nullptr ? convertNVTETensor(add) : nullptr;
   const bool has_add = add_cpp != nullptr && add_cpp->has_data();
   Tensor *dx_cpp = convertNVTETensorCheck(dx);
+  Tensor *dx_hp_cpp = dx_high_precision != nullptr ? convertNVTETensor(dx_high_precision) : nullptr;
+  const bool has_dx_hp = dx_hp_cpp != nullptr && dx_hp_cpp->has_data();
   Tensor *dgamma_cpp = convertNVTETensorCheck(dgamma);
   Tensor *dbias_cpp = dbias != nullptr ? convertNVTETensor(dbias) : nullptr;
   const bool has_dbias = dbias_cpp != nullptr && dbias_cpp->has_data();
@@ -674,10 +678,17 @@ void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor x, const NVTET
                dx_cpp->columnwise_scale_inv.shape, ".");
     NVTE_CHECK(rb::is_aligned(dx_cpp->data.dptr) && rb::is_aligned(dx_cpp->columnwise_data.dptr),
                "The MXFP8 data of dx must be 16-byte aligned.");
+    if (has_dx_hp) {
+      NVTE_CHECK(dx_hp_cpp->flat_2d_dims() == x_cpp.flat_2d_dims() && dx_hp_cpp->dtype() == itype,
+                 "dx_high_precision must have the shape and dtype of x.");
+      NVTE_CHECK(rb::is_aligned(dx_hp_cpp->data.dptr),
+                 "dx_high_precision must be 16-byte aligned.");
+    }
   } else {
     NVTE_CHECK(dx_cpp->flat_2d_dims() == x_cpp.flat_2d_dims() && dx_cpp->dtype() == itype,
                "dx must have the shape and dtype of x.");
     NVTE_CHECK(rb::is_aligned(dx_cpp->data.dptr), "dx must be 16-byte aligned.");
+    NVTE_CHECK(!has_dx_hp, "dx_high_precision applies to an MXFP8 dx.");
   }
   const DType gtype = dgamma_cpp->dtype();
   NVTE_CHECK((gtype == itype || gtype == DType::kFloat32) && dgamma_cpp->numel() == cols,
@@ -728,6 +739,7 @@ void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor x, const NVTET
     p.fp8_max_rcp =
         p.e5m2 ? Quantized_Limits<fp8e5m2>::max_norm_rcp : Quantized_Limits<fp8e4m3>::max_norm_rcp;
     p.swizzled_scales = dx_cpp->with_gemm_swizzled_scales;
+    p.dx = has_dx_hp ? dx_hp_cpp->data.dptr : nullptr;
   } else {
     p.dx = dx_cpp->data.dptr;
   }

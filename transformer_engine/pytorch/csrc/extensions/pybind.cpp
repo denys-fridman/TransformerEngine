@@ -411,8 +411,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Backward of RMSNorm in one pass: residual add, MXFP8 output and the weight gradient "
         "reduced in the kernel",
         py::arg("dz"), py::arg("x"), py::arg("rsigma"), py::arg("gamma"), py::arg("add"),
-        py::arg("dx"), py::arg("quantizer"), py::arg("dgamma"), py::arg("dbias"),
-        py::arg("counter"), py::arg("zero_centered_gamma"));
+        py::arg("dx"), py::arg("quantizer"), py::arg("dx_high_precision"), py::arg("dgamma"),
+        py::arg("dbias"), py::arg("counter"), py::arg("zero_centered_gamma"));
   m.def("multi_tensor_quantize", &transformer_engine::pytorch::multi_tensor_quantize,
         "Multi-tensor quantize", py::arg("tensor_list"), py::arg("quantizer_list"));
   m.def("split_quantize", &transformer_engine::pytorch::split_quantize,

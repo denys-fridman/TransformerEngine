@@ -192,6 +192,9 @@ void nvte_rmsnorm_bwd_add(const NVTETensor dz, const NVTETensor x, const NVTETen
  *                                     empty to skip.
  *  \param[out]    dx                  Output gradient of shape [..., H] in the dtype of x, or
  *                                     an MXFP8 tensor with rowwise and columnwise data.
+ *  \param[out]    dx_high_precision   Optional tensor of shape [..., H] in the dtype of x that
+ *                                     receives the rounded dx when dx is MXFP8; NULL or empty
+ *                                     to skip.
  *  \param[out]    dgamma              Gradient for gamma tensor of shape [H], in the dtype of
  *                                     gamma or FP32.
  *  \param[out]    dbias               Optional column sum of dx, shape [H], the dtype of dgamma;
@@ -204,9 +207,9 @@ void nvte_rmsnorm_bwd_add(const NVTETensor dz, const NVTETensor x, const NVTETen
  */
 void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor x, const NVTETensor rsigma,
                             const NVTETensor gamma, const NVTETensor add, NVTETensor dx,
-                            NVTETensor dgamma, NVTETensor dbias, NVTETensor workspace,
-                            NVTETensor counter, const bool zero_centered_gamma,
-                            cudaStream_t stream);
+                            NVTETensor dx_high_precision, NVTETensor dgamma, NVTETensor dbias,
+                            NVTETensor workspace, NVTETensor counter,
+                            const bool zero_centered_gamma, cudaStream_t stream);
 
 /*! \brief Set whether to enable cuDNN backend for normalization forward.
  *

@@ -147,8 +147,11 @@ def rmsnorm_bwd(
         dx._high_precision_data = dx_out
     dw = torch.empty(N, dtype=weight.dtype, device=x.device)
 
-    # The CUDA kernel writes dx in one format only
-    if quantizer is None and _use_cuda_kernel(dy, x, weight, add):
+    if _use_cuda_kernel(dy, x, weight, add):
+        if quantizer is not None and dx._with_gemm_swizzled_scales and M % 128 != 0:
+            # Padding rows are interleaved with the scales in the GEMM layout
+            dx._rowwise_scale_inv.zero_()
+            dx._columnwise_scale_inv.zero_()
         tex.rmsnorm_bwd_fused(
             dy,
             x,
@@ -156,7 +159,8 @@ def rmsnorm_bwd(
             weight,
             add,
             dx,
-            None,
+            quantizer,
+            None if quantizer is None else dx_out,
             dw,
             None,
             _counter(x.device),
