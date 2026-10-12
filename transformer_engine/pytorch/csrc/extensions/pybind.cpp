@@ -232,6 +232,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   transformer_engine::pytorch::bind_quantize_with_amax_extensions(m);
   m.def("group_dequantize", transformer_engine::pytorch::group_dequantize,
         "Dequantize group tensor", py::arg("input"), py::arg("otype"));
+  m.def("gather_quantize_mxfp8", transformer_engine::pytorch::gather_quantize_mxfp8,
+        "Gather rows and quantize them to grouped MXFP8 with GEMM-swizzled scales",
+        py::arg("input"), py::arg("row_to_token"), py::arg("split_sizes"), py::arg("rowwise_data"),
+        py::arg("rowwise_scale_inv"), py::arg("columnwise_data"), py::arg("columnwise_scale_inv"),
+        py::arg("high_precision_data"), py::arg("counter"));
   m.def("bgrad_group_quantize", transformer_engine::pytorch::bgrad_group_quantize,
         py::arg("tensor"), py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"),
         py::arg("last_dims") = py::none(), py::arg("tensor_offsets") = py::none());

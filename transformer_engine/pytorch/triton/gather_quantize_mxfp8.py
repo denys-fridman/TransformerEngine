@@ -2,9 +2,11 @@
 #
 # See LICENSE for license information.
 
-"""PyTorch wrapper for the gather + MXFP8 group quantize Triton kernel."""
+"""Gather rows and quantize them to a GEMM-ready MXFP8 GroupedTensor in one pass."""
 
 import math
+import os
+from typing import Dict, Tuple
 
 import torch
 import triton
@@ -21,6 +23,31 @@ _BLOCK_M = 32
 _BLOCK_K = 256
 _NUM_WARPS = 4
 
+_counters: Dict[Tuple[int, int], torch.Tensor] = {}
+
+
+def _use_cuda_kernel(device: torch.device) -> bool:
+    """CUDA kernel on Blackwell and later, Triton elsewhere, unless the backend is forced."""
+    backend = os.getenv("NVTE_GATHER_QUANTIZE_MXFP8_BACKEND", "auto").lower()
+    if backend == "auto":
+        return torch.cuda.get_device_capability(device)[0] >= 10
+    if backend not in ("cuda", "triton"):
+        raise ValueError(
+            f"NVTE_GATHER_QUANTIZE_MXFP8_BACKEND must be auto, cuda or triton, got {backend!r}."
+        )
+    return backend == "cuda"
+
+
+def _work_counter(device: torch.device) -> torch.Tensor:
+    """The CUDA kernel's work counter, one per stream so that stream order keeps it zero
+    between launches."""
+    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
+    counter = _counters.get(key)
+    if counter is None:
+        counter = torch.zeros(2, dtype=torch.int32, device=device)
+        _counters[key] = counter
+    return counter
+
 
 def gather_quantize_mxfp8(
     src: torch.Tensor,
@@ -34,7 +61,9 @@ def gather_quantize_mxfp8(
 
     Returns what ``tex.group_quantize(src[row_to_token], quantizer, num_groups, split_sizes)``
     returns, bit for bit, without materializing the gathered rows: rowwise and columnwise E4M3
-    data with GEMM-swizzled E8M0 scales, ready for the grouped GEMMs.
+    data with GEMM-swizzled E8M0 scales, ready for the grouped GEMMs. Runs the CUDA kernel on
+    Blackwell and later and the Triton kernel elsewhere; ``NVTE_GATHER_QUANTIZE_MXFP8_BACKEND``
+    (``auto``, ``cuda`` or ``triton``) overrides the choice.
 
     Parameters
     ----------
@@ -98,7 +127,19 @@ def gather_quantize_mxfp8(
         if keep_high_precision
         else None
     )
-    if num_rows > 0:
+    if num_rows > 0 and _use_cuda_kernel(device):
+        tex.gather_quantize_mxfp8(
+            src,
+            row_to_token,
+            split_sizes,
+            rowwise_data,
+            rowwise_scale_inv,
+            columnwise_data,
+            columnwise_scale_inv,
+            high_precision_data,
+            _work_counter(device),
+        )
+    elif num_rows > 0:
         hidden_padded = round_up_to_nearest_multiple(hidden, 128)
         _gather_quantize_mxfp8_kernel[(triton.cdiv(hidden, _BLOCK_K), num_rows // _BLOCK_M)](
             src,

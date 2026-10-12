@@ -417,6 +417,12 @@ py::object nvfp4_group_quantize_with_amax(const at::Tensor &tensor, py::handle q
 
 py::object group_dequantize(const py::handle &input, DType otype);
 
+void gather_quantize_mxfp8(const at::Tensor &input, const at::Tensor &row_to_token,
+                           const at::Tensor &split_sizes, at::Tensor rowwise_data,
+                           at::Tensor rowwise_scale_inv, at::Tensor columnwise_data,
+                           at::Tensor columnwise_scale_inv,
+                           std::optional<at::Tensor> high_precision_data, at::Tensor counter);
+
 py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
                                 const size_t num_tensors, std::optional<at::Tensor> first_dims,
                                 std::optional<at::Tensor> last_dims,

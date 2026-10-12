@@ -737,6 +737,42 @@ py::object dequantize(const py::handle &input, transformer_engine::DType otype) 
   return out;
 }
 
+void gather_quantize_mxfp8(const at::Tensor &input, const at::Tensor &row_to_token,
+                           const at::Tensor &split_sizes, at::Tensor rowwise_data,
+                           at::Tensor rowwise_scale_inv, at::Tensor columnwise_data,
+                           at::Tensor columnwise_scale_inv,
+                           std::optional<at::Tensor> high_precision_data, at::Tensor counter) {
+  init_extension();
+  NVTE_CHECK(input.dim() == 2 && input.is_contiguous(), "input must be a contiguous 2D tensor.");
+  NVTE_CHECK(row_to_token.is_contiguous() && split_sizes.is_contiguous() && counter.is_contiguous(),
+             "row_to_token, split_sizes and counter must be contiguous.");
+  const std::vector<size_t> shape = {static_cast<size_t>(row_to_token.numel()),
+                                     static_cast<size_t>(input.size(1))};
+  const auto numel = [](const at::Tensor &t) {
+    return std::vector<size_t>{static_cast<size_t>(t.numel())};
+  };
+
+  auto input_nvte = makeTransformerEngineTensor(input);
+  auto row_to_token_nvte = makeTransformerEngineTensor(row_to_token);
+  auto split_sizes_nvte = makeTransformerEngineTensor(split_sizes);
+  auto output_nvte = makeTransformerEngineTensor(
+      rowwise_data.data_ptr(), columnwise_data.data_ptr(), shape, shape, DType::kFloat8E4M3,
+      nullptr, nullptr, rowwise_scale_inv.data_ptr(), columnwise_scale_inv.data_ptr(),
+      numel(rowwise_scale_inv), numel(columnwise_scale_inv), NVTE_MXFP8_1D_SCALING);
+  TensorWrapper high_precision_nvte;
+  if (high_precision_data.has_value()) {
+    high_precision_nvte = makeTransformerEngineTensor(
+        high_precision_data->data_ptr(), shape, GetTransformerEngineDType(input.scalar_type()));
+  }
+  auto counter_nvte = makeTransformerEngineTensor(counter);
+
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_gather_quantize_mxfp8(input_nvte.data(), row_to_token_nvte.data(), split_sizes_nvte.data(),
+                               output_nvte.data(), high_precision_nvte.data(), counter_nvte.data(),
+                               at::cuda::getCurrentCUDAStream());
+  });
+}
+
 py::object group_dequantize(const py::handle &input, transformer_engine::DType otype) {
   using namespace pybind11::literals;
   init_extension();
