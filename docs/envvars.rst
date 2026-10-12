@@ -423,18 +423,33 @@ LayerNorm/RMSNorm SM Margins
    :Type: ``int`` (0 or 1)
    :Default: ``0``
    :Description: Run the RMSNorm backward pass of ``LayerNormLinear``, ``LayerNormMLP`` and the
-                 ``RMSNorm`` operation on a single streaming Triton kernel instead of the C++
-                 kernels where it applies: contiguous FP32, FP16 or BF16 tensors on CUDA. The
-                 kernel also adds the residual gradient of a preceding ``MakeExtraOutput``
-                 operation and, when the operation before that consumes its gradient as MXFP8
-                 (for example a ``Linear`` under the MXFP8 recipe, or a ``Quantize`` operation
-                 quantizing in the backward pass), emits the gradient quantized with rowwise and
-                 columnwise scales so that no separate cast is needed, keeping the values before
+                 ``RMSNorm`` operation on a single streaming kernel (see
+                 :envvar:`NVTE_RMSNORM_BWD_BACKEND`) instead of the C++ kernels where it
+                 applies: contiguous FP32, FP16 or BF16 tensors on CUDA. The kernel also adds
+                 the residual gradient of a preceding ``MakeExtraOutput`` operation and, when
+                 the operation before that consumes its gradient as MXFP8 (for example a
+                 ``Linear`` under the MXFP8 recipe, or a ``Quantize`` operation quantizing in
+                 the backward pass), emits the gradient quantized with rowwise and columnwise
+                 scales so that no separate cast is needed, keeping the values before
                  quantization as the tensor's high-precision data for bias gradients and for
-                 accumulation with other gradients. The weight gradient is reduced from per-block
-                 FP32 partial sums, so results match
-                 the C++ kernels within floating-point accumulation error, not bit-for-bit.
-                 :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` does not apply to the Triton kernel.
+                 accumulation with other gradients. The weight gradient is reduced from FP32
+                 partial sums, so results match the C++ kernels within floating-point
+                 accumulation error, not bit-for-bit.
+                 :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` does not apply to the fused kernel.
+
+.. envvar:: NVTE_RMSNORM_BWD_BACKEND
+
+   :Type: ``str``
+   :Default: ``auto``
+   :Description: Kernel of the fused RMSNorm backward pass selected by
+                 :envvar:`NVTE_RMSNORM_BWD_USE_TRITON`. ``cuda`` is a CUDA kernel that reads
+                 the gradient and the input once and reduces the weight gradient in the kernel,
+                 in a fixed order; it takes FP16 or BF16 tensors with a multiple of 32 rows and
+                 a multiple of 32 columns up to 3072, on compute capability 9.0+, and writes
+                 the gradient in one format, so a quantized output stays with the Triton
+                 kernel. ``triton`` is the Triton kernel. ``auto`` picks the CUDA kernel on
+                 Blackwell and later where it applies and the Triton kernel elsewhere. The two
+                 kernels agree within floating-point accumulation error.
 
 .. envvar:: NVTE_FWD_LAYERNORM_SM_MARGIN
 

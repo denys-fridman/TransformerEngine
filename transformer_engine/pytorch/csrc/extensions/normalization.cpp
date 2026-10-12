@@ -302,6 +302,53 @@ std::vector<py::object> rmsnorm_bwd_add(const at::Tensor &dz, const at::Tensor &
   return {py::cast(dx), py::cast(dgamma)};
 }
 
+void rmsnorm_bwd_fused(const at::Tensor &dz, const at::Tensor &x, const at::Tensor &rsigma,
+                       const at::Tensor &gamma, MaybeTensor add, py::handle dx,
+                       py::handle quantizer, at::Tensor dgamma, MaybeTensor dbias,
+                       at::Tensor counter, const bool zero_centered_gamma) {
+  NVTE_CHECK(dz.is_contiguous() && x.is_contiguous() && rsigma.is_contiguous() &&
+                 gamma.is_contiguous() && (!add.has_value() || add->is_contiguous()),
+             "dz, x, rsigma, gamma and add must be contiguous.");
+
+  auto dz_cu = makeTransformerEngineTensor(dz);
+  auto x_cu = makeTransformerEngineTensor(x);
+  auto rsigma_cu = makeTransformerEngineTensor(rsigma);
+  auto gamma_cu = makeTransformerEngineTensor(gamma);
+  TensorWrapper add_cu;
+  if (add.has_value()) {
+    add_cu = makeTransformerEngineTensor(*add);
+  }
+  auto dx_cu = makeTransformerEngineTensor(dx, quantizer);
+  auto dgamma_cu = makeTransformerEngineTensor(dgamma);
+  TensorWrapper dbias_cu;
+  if (dbias.has_value()) {
+    dbias_cu = makeTransformerEngineTensor(*dbias);
+  }
+  auto counter_cu = makeTransformerEngineTensor(counter);
+  TensorWrapper workspace;
+
+  // This call populates tensors with the required config.
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_rmsnorm_bwd_fused(dz_cu.data(), x_cu.data(), rsigma_cu.data(), gamma_cu.data(),
+                           add_cu.data(), dx_cu.data(), dgamma_cu.data(), dbias_cu.data(),
+                           workspace.data(), counter_cu.data(), zero_centered_gamma,
+                           at::cuda::getCurrentCUDAStream());
+  });
+
+  // Alloc space for Tensors.
+  auto workspace_data = allocateSpace(workspace.shape(), workspace.dtype());
+  workspace =
+      makeTransformerEngineTensor(workspace_data.data_ptr(), workspace.shape(), workspace.dtype());
+
+  // Actual call to bwd kernel.
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_rmsnorm_bwd_fused(dz_cu.data(), x_cu.data(), rsigma_cu.data(), gamma_cu.data(),
+                           add_cu.data(), dx_cu.data(), dgamma_cu.data(), dbias_cu.data(),
+                           workspace.data(), counter_cu.data(), zero_centered_gamma,
+                           at::cuda::getCurrentCUDAStream());
+  });
+}
+
 std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &weight, float eps,
                                     py::object out, py::handle quantizer, DType out_dtype,
                                     const int sm_margin, const bool zero_centered_gamma) {
